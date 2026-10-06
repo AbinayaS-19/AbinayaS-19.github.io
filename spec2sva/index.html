@@ -545,12 +545,41 @@ function customAssertions(spec, signals, clk, rst, activeLow) {
     }
   }
 
+  if (out.length === 0 && signals.length > 0) {
+    const sigs = signals.filter(s => !/clk/i.test(s)).slice(0, 8);
+    if (sigs.length > 0) {
+      out.push({
+        title: "No X on " + sigs.join(", "),
+        plain: "None of these signals may ever be unknown. A solid first check for any block, generated from your signal list.",
+        code:
+"property p_no_x;\n" +
+"  @(posedge " + clk + ") " + dis + "\n" +
+"    " + sigs.map(s => "!$isunknown(" + s + ")").join(" && ") + ";\n" +
+"endproperty\n" +
+"a_no_x : assert property (p_no_x);"
+      });
+      const regs = sigs.filter(s => !/rst/i.test(s));
+      if (regs.length > 0) {
+        out.push({
+          title: "Reset values are 0 for " + regs.join(", "),
+          plain: "Right after reset releases, these signals must be 0. Edit the expected values if your spec says otherwise.",
+          code:
+"property p_reset_vals;\n" +
+"  @(posedge " + clk + ")\n" +
+"    $rose(" + rst + ") |-> ##1 (" + regs.map(s => "(" + s + " == 0)").join(" && ") + ");\n" +
+"endproperty\n" +
+"a_reset_vals : assert property (p_reset_vals);"
+        });
+      }
+    }
+  }
+
   if (out.length === 0) {
     out.push({
-      title: "No pattern matched, starter template",
-      plain: "The engine did not recognize a known pattern in this spec. This is a starter you can fill in. The built in examples show full suites for FIFO, APB, and arbiter blocks.",
+      title: "Starter template, add your signals on the left",
+      plain: "Add your signal names, one per line on the left, and generate again. The app will draft no-X and reset checks from them, plus pattern checks when it recognizes your spec language.",
       code:
-"// TODO: describe the requirement from your spec here\n" +
+"// TODO: list your signals on the left, then press Generate\n" +
 "property p_custom;\n" +
 "  @(posedge " + clk + ") " + dis + "\n" +
 "    1'b1; // replace with your antecedent |-> consequent\n" +
@@ -618,7 +647,7 @@ function fullSv() {
   return header + current.map(a => a.code).join("\n\n") + "\n\nendmodule\n";
 }
 
-$("gen").onclick = () => {
+function doGenerate() {
   const clk = ($("clk").value.trim() || "clk");
   const rst = ($("rst").value.trim() || "rst_n");
   const activeLow = $("rstlow").checked;
@@ -632,7 +661,9 @@ $("gen").onclick = () => {
     current = customAssertions(spec, signals, clk, rst, activeLow);
   }
   render();
-};
+}
+
+$("gen").onclick = doGenerate;
 
 document.querySelectorAll("[data-ex]").forEach(btn => {
   btn.onclick = () => {
@@ -649,6 +680,7 @@ document.querySelectorAll("[data-ex]").forEach(btn => {
     $("spec").value = ex.spec;
     $("signals").value = ex.signals;
     currentEx = key;
+    doGenerate();
   };
 });
 
@@ -712,7 +744,14 @@ $("refine").onclick = async () => {
   }
 };
 
-render();
+// preload the FIFO example so the page shows assertions immediately
+(function(){
+  const ex = EXAMPLES.fifo;
+  $("spec").value = ex.spec;
+  $("signals").value = ex.signals;
+  currentEx = "fifo";
+  doGenerate();
+})();
 </script>
 </body>
 </html>
