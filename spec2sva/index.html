@@ -704,10 +704,23 @@ $("download").onclick = () => {
 
 /* ---------- optional AI refine (bring your own key) ---------- */
 
-$("apikey").value = localStorage.getItem("spec2sva_key") || "";
-$("model").value = localStorage.getItem("spec2sva_model") || "gpt-4o-mini";
-$("apikey").addEventListener("input", e => localStorage.setItem("spec2sva_key", e.target.value));
-$("model").addEventListener("input", e => localStorage.setItem("spec2sva_model", e.target.value));
+// storage that never throws, even where the browser blocks it
+var safeStore = {
+  get: function(k){ try { return localStorage.getItem(k) || ""; } catch(e){ return ""; } },
+  set: function(k,v){ try { localStorage.setItem(k, v); } catch(e){} }
+};
+$("apikey").value = safeStore.get("spec2sva_key");
+$("model").value = safeStore.get("spec2sva_model") || "gpt-4o-mini";
+$("apikey").addEventListener("input", function(e){ safeStore.set("spec2sva_key", e.target.value); });
+$("model").addEventListener("input", function(e){ safeStore.set("spec2sva_model", e.target.value); });
+
+// if anything goes wrong at runtime, say so on the page instead of failing silently
+window.addEventListener("error", function(ev){
+  if (current.length === 0) {
+    $("emptyState").style.display = "block";
+    $("emptyState").textContent = "Something went wrong loading the app (" + (ev.message || "unknown error") + "). Try reloading the page.";
+  }
+});
 
 $("refine").onclick = async () => {
   const key = $("apikey").value.trim();
@@ -745,13 +758,18 @@ $("refine").onclick = async () => {
 };
 
 // preload the FIFO example so the page shows assertions immediately
-(function(){
-  const ex = EXAMPLES.fifo;
-  $("spec").value = ex.spec;
-  $("signals").value = ex.signals;
-  currentEx = "fifo";
-  doGenerate();
-})();
+try {
+  (function(){
+    const ex = EXAMPLES.fifo;
+    $("spec").value = ex.spec;
+    $("signals").value = ex.signals;
+    currentEx = "fifo";
+    doGenerate();
+  })();
+} catch (err) {
+  $("emptyState").style.display = "block";
+  $("emptyState").textContent = "Something went wrong loading the app (" + (err.message || "unknown error") + "). Try reloading the page.";
+}
 </script>
 </body>
 </html>
