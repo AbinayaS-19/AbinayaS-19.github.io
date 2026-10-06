@@ -116,6 +116,16 @@
   .acard .ahead strong { font-size: 14px; }
   .acard .sentence { padding: 10px 14px 0; font-size: 13px; color: var(--muted); font-style: italic; }
   .acard .understand { padding: 6px 14px 0; font-size: 13px; }
+  .acard > pre {
+    margin: 10px 14px 14px;
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+    font-size: 13px;
+  }
+  .acard > pre code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .lvl {
     margin: 12px 14px 0;
     border: 1px solid var(--line);
@@ -644,6 +654,16 @@ function buildRequirements(spec, known, ctx) {
 let current = [];
 const $ = function(id){ return document.getElementById(id); };
 
+function levelCode(tag) {
+  const parts = [];
+  current.forEach(function(req){
+    req.levels.forEach(function(lv){
+      if (lv.tag === tag) parts.push("// Requirement " + req.n + ": " + req.sentence + "\n" + lv.code);
+    });
+  });
+  return parts.join("\n\n");
+}
+
 function render() {
   const cards = $("cards");
   cards.innerHTML = "";
@@ -651,60 +671,43 @@ function render() {
   $("emptyState").style.display = has ? "none" : "block";
   $("toolbar").style.display = has ? "flex" : "none";
   if (!has) return;
-  let total = 0;
-  current.forEach(function(r){ total += r.levels.length; });
-  $("count").textContent = current.length + (current.length === 1 ? " requirement" : " requirements") +
-    ", " + total + " assertion variations";
-  current.forEach(function(req){
+  $("count").textContent = current.length + (current.length === 1 ? " requirement" : " requirements") + " found in your spec";
+  const sets = [
+    { tag: "Beginner", cls: "b", note: "The simplest checks for the whole spec, one per requirement." },
+    { tag: "Intermediate", cls: "i", note: "The recommended set. Named properties with reset handled, ready for your testbench." },
+    { tag: "Advanced", cls: "a", note: "Sequence based forms with timing windows and cover points, for thorough checking." },
+    { tag: "Draft", cls: "i", note: "Sentences the app could not fully map to your signals. Fill in the marked spots." }
+  ];
+  sets.forEach(function(set){
+    const code = levelCode(set.tag);
+    if (!code) return;
     const div = document.createElement("div");
     div.className = "acard";
     const head = document.createElement("div");
     head.className = "ahead";
-    const strong = document.createElement("strong");
-    strong.textContent = "Requirement " + req.n;
-    head.appendChild(strong);
+    const tag = document.createElement("span");
+    tag.className = "ltag " + set.cls;
+    tag.textContent = set.tag === "Draft" ? "To finish" : set.tag + " set";
+    const copy = document.createElement("button");
+    copy.className = "btn small";
+    copy.textContent = "Copy";
+    copy.onclick = function(){
+      const done = function(){ copy.textContent = "Copied"; setTimeout(function(){ copy.textContent = "Copy"; }, 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(code).then(done, done);
+      else done();
+    };
+    head.appendChild(tag);
+    head.appendChild(copy);
     div.appendChild(head);
-    const sent = document.createElement("div");
-    sent.className = "sentence";
-    sent.textContent = "\u201C" + req.sentence + "\u201D";
-    div.appendChild(sent);
-    const und = document.createElement("div");
-    und.className = "understand";
-    und.textContent = req.understanding;
-    div.appendChild(und);
-    req.levels.forEach(function(lv){
-      const l = document.createElement("div");
-      l.className = "lvl";
-      const lh = document.createElement("div");
-      lh.className = "lhead";
-      const tag = document.createElement("span");
-      tag.className = "ltag " + lv.cls;
-      tag.textContent = lv.tag;
-      const copy = document.createElement("button");
-      copy.className = "btn small";
-      copy.textContent = "Copy";
-      copy.onclick = function(){
-        const done = function(){ copy.textContent = "Copied"; setTimeout(function(){ copy.textContent = "Copy"; }, 1500); };
-        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(lv.code).then(done, done);
-        else done();
-      };
-      lh.appendChild(tag);
-      lh.appendChild(copy);
-      l.appendChild(lh);
-      const note = document.createElement("div");
-      note.className = "lnote";
-      note.textContent = lv.note;
-      l.appendChild(note);
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      code.textContent = lv.code;
-      pre.appendChild(code);
-      l.appendChild(pre);
-      div.appendChild(l);
-    });
-    const pad = document.createElement("div");
-    pad.className = "pad";
-    div.appendChild(pad);
+    const note = document.createElement("div");
+    note.className = "understand";
+    note.textContent = set.note;
+    div.appendChild(note);
+    const pre = document.createElement("pre");
+    const codeEl = document.createElement("code");
+    codeEl.textContent = code;
+    pre.appendChild(codeEl);
+    div.appendChild(pre);
     cards.appendChild(div);
   });
 }
@@ -712,20 +715,14 @@ function render() {
 function recommendedSv() {
   const header =
     "// Generated by spec2sva from your spec text\n" +
-    "// Recommended set: the Intermediate variation of each requirement.\n" +
+    "// Recommended set: the Intermediate assertions.\n" +
     "// Review every assertion before binding to your DUT.\n" +
     "// Bind example: bind dut spec2sva_checks checks (.clk(clk), .rst_n(rst_n));\n\n" +
     "module spec2sva_checks (\n" +
     "  input logic " + $("clk").value.trim() + ",\n" +
     "  input logic " + $("rst").value.trim() + "\n" +
     ");\n\n";
-  const body = current.map(function(req){
-    let lv = null;
-    req.levels.forEach(function(l){ if (!lv && (l.tag === "Intermediate" || l.tag === "Draft")) lv = l; });
-    if (!lv) lv = req.levels[0];
-    return "// Requirement " + req.n + ": " + req.sentence + "\n" + lv.code;
-  }).join("\n\n");
-  return header + body + "\n\nendmodule\n";
+  return header + levelCode("Intermediate") + "\n\nendmodule\n";
 }
 
 function doGenerate() {
