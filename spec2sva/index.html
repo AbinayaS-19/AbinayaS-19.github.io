@@ -887,9 +887,19 @@ function coverEn(core) {
   return body === null ? null : "Cover point: it must be possible that " + body + ".";
 }
 
+function looksLikeEnglish(src) {
+  return !/(\|->|\|=>|\$|property|assert|assume|cover|&&|\|\||==|!|#)/.test(src);
+}
+
 function explainSva(src) {
   const results = [];
-  let text = "\n" + String(src).replace(/\/\/[^\n]*/g, "") + "\n";
+  const rawText = String(src).replace(/\/\/[^\n]*/g, "");
+  if (rawText.trim() && looksLikeEnglish(rawText)) {
+    results.push({ label: "(your text)", verb: "assert", core: "",
+      english: "That looks like plain English, not SVA. This tab goes the other way: paste an assertion and it explains it in English. Try: a1 : assert property (@(posedge clk) $rose(req) |-> ##[1:3] $rose(ack));" });
+    return results;
+  }
+  let text = "\n" + rawText + "\n";
   const clockRe = "@\\(\\s*(?:posedge|negedge)\\s+\\w+(?:\\s+or\\s+(?:posedge|negedge)\\s+\\w+)?\\s*\\)";
   const propRe = new RegExp(
     "property\\s+(\\w+)\\s*;\\s*" + clockRe +
@@ -901,8 +911,7 @@ function explainSva(src) {
     return "\n";
   });
   const oneRe = new RegExp(
-    "(\\w+)\\s*:\\s*(assert|assume|cover)\\s+property\\s*\\(" + clockRe +
-    "\\s*(disable\\s+iff\\s*\\([^)]*\\))?\\s*([\\s\\S]*?)\\)\\s*;",
+    "(\\w+)\\s*:\\s*(assert|assume|cover)\\s+property\\s*\\((?:" + clockRe + "\\s*)?(disable\\s+iff\\s*\\([^)]*\\))?\\s*([\\s\\S]*?)\\)\\s*;",
     "gi");
   let m2;
   while ((m2 = oneRe.exec(text)) !== null) {
@@ -917,7 +926,7 @@ function explainSva(src) {
     if (r.verb === "cover") body = coverEn(r.core);
     else body = coreBodyEn(r.core);
     if (body === null) {
-      r.english = "This one uses a form the explainer does not cover yet.";
+      r.english = "This one uses a form the explainer does not cover yet. It understands $rose, $fell, $stable, |->, |=>, ##N, until, and $onehot. Try: a1 : assert property (@(posedge clk) $rose(req) |-> ##[1:3] $rose(ack));";
       return;
     }
     if (r.verb === "assume") r.english = "The testbench must ensure that " + body + ".";
