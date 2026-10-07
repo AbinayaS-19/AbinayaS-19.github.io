@@ -126,6 +126,9 @@
     font-size: 13px;
   }
   .acard > pre code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .gapcat { font-size: 13px; font-weight: 700; margin: 12px 14px 4px; }
+  .gaplist { margin: 0 14px 10px; padding-left: 20px; font-size: 13px; }
+  .gaplist li { margin-bottom: 5px; }
   .lvl {
     margin: 12px 14px 0;
     border: 1px solid var(--line);
@@ -175,7 +178,7 @@
 <body>
 <header>
   <h1>spec<span>2</span>sva</h1>
-  <p>Type any spec. Get beginner, intermediate, and advanced assertion variations for every requirement it states.</p>
+  <p>Type any spec. Get beginner, intermediate, and advanced assertion variations for every requirement it states. A completeness gate checks clock, reset, signal directions, and timing before anything is generated.</p>
 </header>
 <main>
   <section class="panel">
@@ -241,8 +244,8 @@
 
 const EXAMPLES = {
   fifo: {
-    spec: "When wr_en is high and full is low, wr_ptr increments in the next cycle.\nWhen full is high, wr_ptr must remain stable.\nfull and empty are never high at the same time.\nAfter reset, wr_ptr is 0 and empty is asserted.",
-    signals: "wr_en\nrd_en\nfull\nempty\nwr_ptr\nrd_ptr"
+    spec: "Clock: clk, posedge\nReset: rst_n, active low, asynchronous\nDepth: 16\n\nSignals:\n  wr_en  : input  logic        ; driven by testbench\n  rd_en  : input  logic        ; driven by testbench\n  din    : input  logic [7:0]  ; driven by testbench\n  full   : output logic        ; guaranteed by DUT\n  empty  : output logic        ; guaranteed by DUT\n  dout   : output logic [7:0]  ; guaranteed by DUT\n  wr_ptr : output logic [3:0]  ; guaranteed by DUT\n  rd_ptr : output logic [3:0]  ; guaranteed by DUT\n\nRequirements (all sampled on posedge clk):\n  1. When wr_en is high and full is low, wr_ptr increments in the next cycle.\n  2. When full is high, wr_ptr must remain stable in the next cycle.\n  3. full and empty are never high at the same time.\n  4. When rd_en is high and empty is low, dout updates in the next cycle and rd_ptr increments in the next cycle.\n  5. When wr_en is high and full is low, full is low in the same cycle.\n  6. When rd_en is high and empty is low, empty is low in the same cycle.\n  7. After reset, wr_ptr is 0, rd_ptr is 0, full is low, and empty is high.",
+    signals: "wr_en\nrd_en\ndin\nfull\nempty\ndout\nwr_ptr\nrd_ptr"
   },
   apb: {
     spec: "When PSEL is high and PENABLE is low, PSEL and PENABLE are high in the next cycle.\nPREADY must only be high when PSEL and PENABLE are high.\nPSLVERR must only be high when PREADY is high.\nPADDR must remain stable while PSEL is high.",
@@ -253,6 +256,133 @@ const EXAMPLES = {
     signals: "req[3:0]\ngrant[3:0]"
   }
 };
+
+/* ---------- spec header parsing ---------- */
+
+function parseSpecHeader(spec) {
+  const hdr = { clock: null, reset: null, depth: null, signals: [], globalSample: null };
+  const bodyLines = [];
+  let inSignals = false;
+  spec.split("\n").forEach(function(line){
+    let m;
+    if (m = line.match(/^\s*clock\s*:\s*([A-Za-z_]\w*)\s*(?:,\s*(posedge|negedge))?/i)) {
+      hdr.clock = { name: m[1], edge: (m[2] || "").toLowerCase() || null };
+      return;
+    }
+    if (m = line.match(/^\s*reset\s*:\s*([A-Za-z_]\w*)\s*(?:,\s*active\s+(low|high))?\s*(?:,\s*(synchronous|asynchronous))?/i)) {
+      hdr.reset = { name: m[1], activeLow: m[2] ? m[2].toLowerCase() === "low" : null, sync: m[3] ? m[3].toLowerCase() === "synchronous" : null };
+      return;
+    }
+    if (m = line.match(/^\s*depth\s*:\s*(\d+)/i)) { hdr.depth = parseInt(m[1], 10); return; }
+    if (/^\s*signals\s*:/i.test(line)) { inSignals = true; return; }
+    if (/^\s*requirements\b/i.test(line)) {
+      inSignals = false;
+      const gm = line.match(/all[^.\n]*sampled\s+on\s+(posedge|negedge)/i);
+      if (gm) hdr.globalSample = gm[1].toLowerCase();
+      return;
+    }
+    if (inSignals) {
+      if (!line.trim()) { inSignals = false; return; }
+      m = line.match(/^\s*([A-Za-z_]\w*)(\s*\[[^\]]*\])?\s*:\s*(input|output|inout)\s+(\w+)(\s*\[[^\]]*\])?\s*(?:;(.+))?$/i);
+      if (m) {
+        const comment = (m[6] || "");
+        let role = null;
+        if (/testbench|stimulus|driver|\bassume\b/i.test(comment)) role = "assume";
+        else if (/\bdut\b|guarantee|\bassert\b/i.test(comment)) role = "assert";
+        hdr.signals.push({ name: m[1], dir: m[3].toLowerCase(), type: m[4], width: (m[2] || m[5] || "").trim(), role: role });
+        return;
+      }
+      inSignals = false;
+    }
+    const gm2 = line.match(/all[^.\n]*sampled\s+on\s+(posedge|negedge)/i);
+    if (gm2) hdr.globalSample = gm2[1].toLowerCase();
+    bodyLines.push(line);
+  });
+  return { hdr: hdr, body: bodyLines.join("\n") };
+}
+
+/* ---------- completeness gate ---------- */
+
+function runGate(specText, uiClk, uiRst, uiRstLow) {
+  const parsed = parseSpecHeader(specText);
+  const hdr = parsed.hdr;
+  const gaps = [];
+  const notes = [];
+
+  const clkName = hdr.clock ? hdr.clock.name : (uiClk || null);
+  if (!clkName) {
+    gaps.push({ cat: "Clock", msg: "No clock named. Add a 'Clock: <name>, posedge/negedge' line or fill the Clock box." });
+  }
+  const edge = hdr.clock && hdr.clock.edge ? hdr.clock.edge : null;
+  if (clkName && !edge) {
+    gaps.push({ cat: "Clock", msg: "Clock edge not specified for '" + clkName + "'. Assuming posedge; write posedge or negedge in the Clock line to pin it down." });
+    notes.push("Clock edge assumed posedge.");
+  }
+
+  const rstName = hdr.reset ? hdr.reset.name : (uiRst || null);
+  if (!rstName) {
+    gaps.push({ cat: "Reset", msg: "No reset named. Add a 'Reset: <name>, active low/high, synchronous/asynchronous' line or fill the Reset box." });
+  }
+  let activeLow = hdr.reset && hdr.reset.activeLow !== null ? hdr.reset.activeLow : null;
+  if (rstName && activeLow === null) {
+    activeLow = !!uiRstLow;
+    gaps.push({ cat: "Reset", msg: "Reset active level not stated for '" + rstName + "'. Assuming active " + (activeLow ? "low" : "high") + "; write active low or active high in the Reset line." });
+    notes.push("Reset assumed active " + (activeLow ? "low" : "high") + ".");
+  }
+  let sync = hdr.reset && hdr.reset.sync !== null ? hdr.reset.sync : null;
+  if (rstName && sync === null) {
+    sync = false;
+    gaps.push({ cat: "Reset", msg: "Reset style not stated for '" + rstName + "'. Assuming asynchronous; write synchronous or asynchronous in the Reset line." });
+    notes.push("Reset assumed asynchronous.");
+  }
+
+  // merge declared signals with the UI signal list (declared wins)
+  const byName = {};
+  hdr.signals.forEach(function(s){ byName[s.name.toLowerCase()] = s; });
+  parseSignals($("signals").value).forEach(function(n){
+    const k = n.toLowerCase();
+    if (!byName[k]) byName[k] = { name: n, dir: null, type: null, width: "", role: null };
+  });
+  const signals = Object.keys(byName).map(function(k){ return byName[k]; });
+
+  signals.forEach(function(s){
+    if (!s.dir) gaps.push({ cat: "Signals", msg: "Signal '" + s.name + "': direction missing. Is it an input, output, or inout?" });
+    if (!s.type) gaps.push({ cat: "Signals", msg: "Signal '" + s.name + "': data type missing. E.g. logic." });
+    if (!s.width && s.type && !/^(logic|bit|reg)$/i.test(s.type)) {
+      gaps.push({ cat: "Signals", msg: "Signal '" + s.name + "': width not specified for type '" + s.type + "'. Write [m:0] in the signal line if wider than 1 bit." });
+      notes.push("'" + s.name + "' treated as 1 bit.");
+    }
+    if (!s.role) gaps.push({ cat: "Signals", msg: "Signal '" + s.name + "': role not marked. Is it driven by the testbench (assume side) or guaranteed by the DUT (assert side)?" });
+  });
+
+  // depth vs pointer width consistency
+  if (hdr.depth) {
+    const need = Math.ceil(Math.log(hdr.depth) / Math.log(2));
+    signals.forEach(function(s){
+      const m = s.width.match(/\[\s*(\d+)\s*:\s*0\s*\]/);
+      if (m && /ptr/i.test(s.name) && (parseInt(m[1], 10) + 1) < need) {
+        gaps.push({ cat: "Consistency", msg: "Pointer '" + s.name + "' is [" + m[1] + ":0] (" + (parseInt(m[1], 10) + 1) + " bits) but depth " + hdr.depth + " needs " + need + " bits." });
+      }
+    });
+  }
+
+  // timing on every requirement
+  const reqTexts = splitSentences(parsed.body);
+  reqTexts.forEach(function(s, i){
+    const t = s.toLowerCase();
+    const hasTiming = hdr.globalSample || extractTiming(t) || /\bsampled\s+on\b/.test(t) || /\b(always|every clock cycle)\b/.test(t);
+    if (!hasTiming) {
+      gaps.push({ cat: "Timing", msg: "Requirement " + (i + 1) + " has no explicit timing (which edge? how many cycles?). Quote: \"" + s.slice(0, 80) + (s.length > 80 ? "..." : "") + "\"" });
+    }
+  });
+
+  return {
+    hdr: hdr, body: parsed.body, gaps: gaps, notes: notes,
+    clkName: clkName, edge: edge || "posedge",
+    rstName: rstName, activeLow: activeLow, sync: !!sync,
+    signals: signals, reqTexts: reqTexts
+  };
+}
 
 /* ---------- text utilities ---------- */
 
@@ -280,7 +410,7 @@ function findSignalIn(clause, known) {
   let best = null;
   known.forEach(function(k){
     const b = baseName(k).toLowerCase();
-    if (b.length < 2) return;
+    if (b.length < 1) return;
     const re = new RegExp("(^|[^A-Za-z0-9_])" + b.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^A-Za-z0-9_]|$)");
     if (re.test(low) && (!best || b.length > baseName(best).length)) best = k;
   });
@@ -308,7 +438,7 @@ function atomExpr(clause, known) {
   let e = null;
   if (/\b(rises?|rose|rising edge|posedge)\b/.test(t)) e = "$rose(" + sig + ")";
   else if (/\b(falls?|fell|falling edge|negedge)\b/.test(t)) e = "$fell(" + sig + ")";
-  else if (/\b(changes?|changed|toggles?|toggled)\b/.test(t)) e = "$changed(" + sig + ")";
+  else if (/\b(changes?|changed|toggles?|toggled|updates?|updated)\b/.test(t)) e = "$changed(" + sig + ")";
   else if (/\bincrements?\b/.test(t)) e = "(" + sig + " == $past(" + sig + ") + 1)";
   else if (/\bdecrements?\b/.test(t)) e = "(" + sig + " == $past(" + sig + ") - 1)";
   else if (/\b(stable|unchanged|remains?|hold|holds|holding|must not change|does not change|do not change|constant)\b/.test(t)) e = "$stable(" + sig + ")";
@@ -361,6 +491,7 @@ function extractTiming(lower) {
   m = lower.match(/after\s+(\d+)\s+cycles?/);
   if (m) return { op: "##" + m[1], words: m[1] + " cycles later" };
   if (/\bin the next cycle\b|\bnext cycle\b/.test(lower)) return { op: "|=>", words: "in the next cycle" };
+  if (/\bin the same cycle\b|\bsame cycle\b/.test(lower)) return { op: "|->", words: "in the same cycle" };
   if (/\beventually\b/.test(lower)) return { op: "s_eventually", words: "eventually" };
   return null;
 }
@@ -374,127 +505,190 @@ function addLevel(req, tag, cls, code, note) {
   req.levels.push({ tag: tag, cls: cls, code: code, note: note });
 }
 
-function buildImplication(req, A, C, timing, ctx) {
-  const cop = timing && timing.op === "|=>" ? "|=>" : "|->";
-  const cexpr = timing && timing.op !== "|=>" ? C.replace(/\)\s*$/, "") : C;
-  // beginner: one line
-  addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\na_req" + req.n + " : assert property (@(posedge " + ctx.clk + ") " + A + " " + cop + " " + C + ");",
-    "The simplest form. Whenever the left side holds, the right side must hold " + (cop === "|=>" ? "in the next cycle." : "in the same cycle."));
-  // intermediate: named property with reset
-  addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    " + A + " " + cop + " " + C + ";\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
-    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench.");
-  // advanced: sequence + cover
-  let adv, cover;
-  if (timing && timing.op !== "|=>" && timing.op !== "s_eventually") {
-    adv = "sequence s_req" + req.n + "_cause;\n  " + A + ";\nendsequence\nproperty p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    s_req" + req.n + "_cause |-> " + timing.op + " " + C + ";\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);";
-    cover = "c_req" + req.n + " : cover property (@(posedge " + ctx.clk + ") " + ctx.dis + " " + A + " " + timing.op + " " + C + ");";
-  } else if (timing && timing.op === "s_eventually") {
-    adv = "property p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    " + A + " |-> s_eventually " + C + ";\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);";
-    cover = "c_req" + req.n + " : cover property (@(posedge " + ctx.clk + ") " + ctx.dis + " " + A + " ##1 " + C + ");";
-  } else {
-    adv = "sequence s_req" + req.n + "_cause;\n  " + A + ";\nendsequence\nproperty p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    s_req" + req.n + "_cause " + cop + " " + C + ";\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);";
-    cover = "c_req" + req.n + " : cover property (@(posedge " + ctx.clk + ") " + ctx.dis + " " + A + " ##1 " + C + ");";
+/* Shared helpers for the builders: assert vs assume by signal role,
+   sync/async reset handling, explicit reset values. */
+
+function roleOf(sigName, ctx) {
+  const b = baseName(sigName).toLowerCase();
+  for (let i = 0; i < ctx.signals.length; i++) {
+    if (baseName(ctx.signals[i].name).toLowerCase() === b) return ctx.signals[i].role;
   }
-  addLevel(req, "Advanced", "a", adv + "\n" + cover,
+  return null;
+}
+
+// A requirement that constrains testbench-driven inputs is an assumption;
+// one that checks DUT-guaranteed outputs is an assertion.
+function verbForClause(clause, ctx) {
+  const sigs = extractSignals(clause, ctx.signals.map(function(s){ return s.name; }));
+  const roles = sigs.map(function(s){ return roleOf(s, ctx); }).filter(Boolean);
+  if (roles.length > 0 && roles.every(function(r){ return r === "assume"; })) return { kw: "assume", pre: "am_" };
+  return { kw: "assert", pre: "a_" };
+}
+
+function wrapSync(ctx, core) {
+  return ctx.sync ? "(" + ctx.notRst + ") |-> (" + core + ")" : core;
+}
+
+function propLines(ctx, pname, core, vname, vkw) {
+  const D = ctx.dis ? " " + ctx.dis : "";
+  return "property " + pname + ";\n  @(" + ctx.event + ")" + D + "\n    " + wrapSync(ctx, core) + ";\nendproperty\n" +
+    vname + " : " + vkw + " property (" + pname + ");";
+}
+
+function oneLiner(ctx, vname, vkw, core, comment) {
+  const D = ctx.dis ? " " + ctx.dis : "";
+  return (comment ? "// " + comment + "\n" : "") +
+    vname + " : " + vkw + " property (@(" + ctx.event + ")" + D + " " + wrapSync(ctx, core) + ");";
+}
+
+function parseResetValues(sentence, known) {
+  const vals = [];
+  sentence.split(/\s+and\s+|,\s*/i).forEach(function(p){
+    const sig = findSignalIn(p, known);
+    if (!sig) return;
+    const t = " " + p.toLowerCase() + " ";
+    const m = t.match(/=\s*(0x[0-9a-f]+|\d+)/) || t.match(/\bis\s+(0x[0-9a-f]+|\d+)\b/);
+    if (m) { vals.push({ sig: sig, expr: "(" + sig + " == " + m[1] + ")" }); return; }
+    if (/\b(high|asserted)\b/.test(t) && !/\b(low|deasserted)\b/.test(t)) { vals.push({ sig: sig, expr: sig }); return; }
+    vals.push({ sig: sig, expr: "(!" + sig + ")" });
+  });
+  return vals;
+}
+
+function buildImplication(req, A, C, timing, ctx, conClause) {
+  const V = verbForClause(conClause || "", ctx);
+  const cop = timing && timing.op === "|=>" ? "|=>" : "|->";
+  addLevel(req, "Beginner", "b",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, A + " " + cop + " " + C, req.sentence),
+    "The simplest form. Whenever the left side holds, the right side must hold " + (cop === "|=>" ? "in the next cycle." : "in the same cycle."));
+  addLevel(req, "Intermediate", "i",
+    propLines(ctx, "p_req" + req.n, A + " " + cop + " " + C, V.pre + "req" + req.n, V.kw),
+    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench.");
+  let advCore, coverCore;
+  if (timing && timing.op !== "|=>" && timing.op !== "s_eventually") {
+    advCore = "s_req" + req.n + "_cause |-> " + timing.op + " " + C;
+    coverCore = A + " " + timing.op + " " + C;
+  } else if (timing && timing.op === "s_eventually") {
+    advCore = A + " |-> s_eventually " + C;
+    coverCore = A + " ##1 " + C;
+  } else {
+    advCore = "s_req" + req.n + "_cause " + cop + " " + C;
+    coverCore = A + " ##1 " + C;
+  }
+  const D = ctx.dis ? " " + ctx.dis : "";
+  const seqPart = (timing && timing.op === "s_eventually")
+    ? ""
+    : "sequence s_req" + req.n + "_cause;\n  " + A + ";\nendsequence\n";
+  addLevel(req, "Advanced", "a",
+    seqPart + propLines(ctx, "p_req" + req.n + "_adv", advCore, V.pre + "req" + req.n + "_adv", V.kw) +
+    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " " + coverCore + ");",
     "Sequence based form plus a cover point, so you also prove the scenario is reachable and not vacuous.");
 }
 
-function buildInvariant(req, X, ctx) {
+function buildInvariant(req, X, ctx, clause) {
+  const V = verbForClause(clause || "", ctx);
   addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\na_req" + req.n + " : assert property (@(posedge " + ctx.clk + ") !(" + X + "));",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, "!(" + X + ")", req.sentence),
     "The simplest form. This condition must never be true on any clock edge.");
   addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    !(" + X + ");\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
+    propLines(ctx, "p_req" + req.n, "!(" + X + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled, so it never fires during reset.");
+  const D = ctx.dis ? " " + ctx.dis : "";
   addLevel(req, "Advanced", "a",
-    "sequence s_req" + req.n + "_bad;\n  (" + X + ");\nendsequence\nproperty p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    not s_req" + req.n + "_bad;\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);",
+    "sequence s_req" + req.n + "_bad;\n  (" + X + ");\nendsequence\n" +
+    propLines(ctx, "p_req" + req.n + "_adv", "not s_req" + req.n + "_bad", V.pre + "req" + req.n + "_adv", V.kw),
     "Sequence negation form. Reads as a forbidden scenario, which scales better when the condition grows.");
 }
 
 function buildMutex(req, gs, ctx) {
+  const V = verbForClause(gs.join(" "), ctx);
   const list = gs.join(", ");
+  const D = ctx.dis ? " " + ctx.dis : "";
   addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\na_req" + req.n + " : assert property (@(posedge " + ctx.clk + ") $onehot0({" + list + "}));",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, "$onehot0({" + list + "})", req.sentence),
     "At most one of these may be high at a time. $onehot0 is the idiomatic check.");
   addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    $onehot0({" + list + "});\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
+    propLines(ctx, "p_req" + req.n, "$onehot0({" + list + "})", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
   if (gs.length === 1) {
     addLevel(req, "Advanced", "a",
-      "property p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    $onehot(" + gs[0] + ");\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);\nc_req" + req.n + " : cover property (@(posedge " + ctx.clk + ") " + ctx.dis + " $onehot(" + gs[0] + "));",
+      propLines(ctx, "p_req" + req.n + "_adv", "$onehot(" + gs[0] + ")", V.pre + "req" + req.n + "_adv", V.kw) +
+      "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $onehot(" + gs[0] + "));",
       "Exactly-one form, stronger than at most one, plus a cover point.");
     return;
   }
   const impl = gs.map(function(g){ return g + " |-> !(" + gs.filter(function(x){ return x !== g; }).join(" || ") + ")"; }).join(" &&\n    ");
   addLevel(req, "Advanced", "a",
-    "property p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    " + impl + ";\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);\nc_req" + req.n + " : cover property (@(posedge " + ctx.clk + ") " + ctx.dis + " $onehot({" + list + "}));",
+    propLines(ctx, "p_req" + req.n + "_adv", impl, V.pre + "req" + req.n + "_adv", V.kw) +
+    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $onehot({" + list + "}));",
     "Per signal implication form, which tells you exactly which signal broke the rule, plus a cover that each one is reachable.");
 }
 
 function buildStability(req, X, C, ctx) {
+  const V = verbForClause(X, ctx);
   addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\na_req" + req.n + " : assert property (@(posedge " + ctx.clk + ") (" + C + ") |-> $stable(" + X + "));",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, "(" + C + ") |-> $stable(" + X + ")", req.sentence),
     "The simplest form. While the condition holds, the signal must not change.");
   addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    (" + C + ") |-> $stable(" + X + ");\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
+    propLines(ctx, "p_req" + req.n, "(" + C + ") |-> $stable(" + X + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
   addLevel(req, "Advanced", "a",
-    "property p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    $rose(" + C + ") |-> $stable(" + X + ") [*1:$] ##1 $fell(" + C + ");\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);",
+    propLines(ctx, "p_req" + req.n + "_adv", "$rose(" + C + ") |-> $stable(" + X + ") [*1:$] ##1 $fell(" + C + ")", V.pre + "req" + req.n + "_adv", V.kw),
     "Holds the signal stable across the entire window the condition is true, from rise to fall.");
 }
 
-function buildReset(req, regs, ctx) {
-  const checks = regs.map(function(s){ return "(" + s + " == 0)"; }).join(" && ");
+function buildReset(req, vals, ctx) {
+  const V = verbForClause(vals.map(function(v){ return v.sig; }).join(" "), ctx);
+  const checks = vals.map(function(v){ return v.expr; }).join(" && ");
+  const rstAsserted = ctx.activeLow ? "(!" + ctx.rst + ")" : ctx.rst;
+  const rstDeasserted = ctx.activeLow ? ctx.rst : "(!" + ctx.rst + ")";
+  const trig = ctx.sync
+    ? rstAsserted + " ##1 " + rstDeasserted
+    : (ctx.activeLow ? "$fell(" + ctx.rst + ")" : "$rose(" + ctx.rst + ")");
   addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\na_req" + req.n + " : assert property (@(posedge " + ctx.clk + ") $fell(" + ctx.rst + ") |-> ##1 (" + checks + "));",
-    "The simplest form. One cycle after reset falls, every listed signal must be 0.");
+    "// " + req.sentence + "\n" + V.pre + "req" + req.n + " : " + V.kw + " property (@(" + ctx.event + ") " + trig + " |-> ##1 (" + checks + "));",
+    "The simplest form. One cycle after reset " + (ctx.sync ? "deasserts (sampled)" : "falls") + ", the listed signals must hold their reset values.");
   addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(posedge " + ctx.clk + ")\n    $fell(" + ctx.rst + ") |-> ##1 (" + checks + ");\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
-    "Named property. Edit any expected value that is not 0 in your design.");
-  const xchecks = regs.map(function(s){ return "(" + s + " == 0) && !$isunknown(" + s + ")"; }).join(" && ");
+    "property p_req" + req.n + ";\n  @(" + ctx.event + ")\n    " + trig + " |-> ##1 (" + checks + ");\nendproperty\n" +
+    V.pre + "req" + req.n + " : " + V.kw + " property (p_req" + req.n + ");",
+    "Named property spelling out each reset value from your spec.");
+  const xchecks = vals.map(function(v){ return v.expr + " && !$isunknown(" + v.sig + ")"; }).join(" && ");
   addLevel(req, "Advanced", "a",
-    "property p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ")\n    $rose(" + ctx.rst + ") |-> ##1 (" + xchecks + ");\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);",
-    "Also checks for X, so an uninitialized register cannot hide behind a 0 comparison.");
+    "property p_req" + req.n + "_adv;\n  @(" + ctx.event + ")\n    " + trig + " |-> ##1 (" + xchecks + ");\nendproperty\n" +
+    V.pre + "req" + req.n + "_adv : " + V.kw + " property (p_req" + req.n + "_adv);",
+    "Also checks for X, so an uninitialized register cannot hide behind a reset value comparison.");
 }
 
-function buildLiveness(req, E, ctx) {
+function buildLiveness(req, E, ctx, clause) {
+  const V = verbForClause(clause || "", ctx);
+  const D = ctx.dis ? " " + ctx.dis : "";
   addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\na_req" + req.n + " : assert property (@(posedge " + ctx.clk + ") s_eventually (" + E + "));",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, "s_eventually (" + E + ")", req.sentence),
     "The simplest liveness form. This must become true at some point, with no fixed deadline.");
   addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    s_eventually (" + E + ");\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
+    propLines(ctx, "p_req" + req.n, "s_eventually (" + E + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
   addLevel(req, "Advanced", "a",
-    "property p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    s_eventually (" + E + ");\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);\nc_req" + req.n + " : cover property (@(posedge " + ctx.clk + ") " + ctx.dis + " (" + E + "));",
+    propLines(ctx, "p_req" + req.n + "_adv", "s_eventually (" + E + ")", V.pre + "req" + req.n + "_adv", V.kw) +
+    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " (" + E + "));",
     "Same check plus a cover point proving the awaited condition is reachable.");
 }
 
-function buildUntil(req, A, B, ctx) {
+function buildUntil(req, A, B, ctx, clause) {
+  const V = verbForClause(clause || "", ctx);
   addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\na_req" + req.n + " : assert property (@(posedge " + ctx.clk + ") (" + A + ") until (" + B + "));",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, "(" + A + ") until (" + B + ")", req.sentence),
     "The simplest form. A must hold on every cycle until B becomes true.");
   addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    (" + A + ") until (" + B + ");\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
+    propLines(ctx, "p_req" + req.n, "(" + A + ") until (" + B + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
+  const D = ctx.dis ? " " + ctx.dis : "";
   addLevel(req, "Advanced", "a",
-    "property p_req" + req.n + "_adv;\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    (" + A + ") s_until_with (" + B + ");\nendproperty\na_req" + req.n + "_adv : assert property (p_req" + req.n + "_adv);\nc_req" + req.n + " : cover property (@(posedge " + ctx.clk + ") " + ctx.dis + " (" + A + ") ##1 (" + B + "));",
+    propLines(ctx, "p_req" + req.n + "_adv", "(" + A + ") s_until_with (" + B + ")", V.pre + "req" + req.n + "_adv", V.kw) +
+    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " (" + A + ") ##1 (" + B + "));",
     "Strong until, which also requires B to actually arrive, plus a cover point.");
 }
 
-function buildTemplate(req, ctx, known) {
-  addLevel(req, "Draft", "i",
-    "// " + req.sentence + "\n// The app could not map this sentence to signals. Fill in the expression below.\nproperty p_req" + req.n + ";\n  @(posedge " + ctx.clk + ") " + ctx.dis + "\n    1'b1; // replace with your condition, e.g. (sig_a |-> sig_b)\nendproperty\na_req" + req.n + " : assert property (p_req" + req.n + ");",
-    "A starting skeleton with reset handling. Replace 1'b1 with the real condition.");
-  if (known.length > 0) {
-    const sigs = known.slice(0, 8);
-    addLevel(req, "Beginner", "b",
-      "a_req" + req.n + "_nox : assert property (@(posedge " + ctx.clk + ") " + ctx.dis + " " +
-        sigs.map(function(s){ return "!$isunknown(" + s + ")"; }).join(" && ") + ");",
-      "A useful freebie from your signal list: none of these may ever be X.");
-  }
-}
 </script>
 <script>
 "use strict";
@@ -512,9 +706,11 @@ function dataSigs(known) {
   });
 }
 
-function buildRequirements(spec, known, ctx) {
-  const sentences = splitSentences(spec);
+function buildRequirements(body, ctx) {
+  const known = ctx.signals.map(function(s){ return s.name; });
+  const sentences = splitSentences(body);
   const reqs = [];
+  const skipped = [];
   sentences.forEach(function(s, idx){
     const n = idx + 1;
     const t = " " + s.toLowerCase() + " ";
@@ -522,10 +718,14 @@ function buildRequirements(spec, known, ctx) {
 
     // reset
     if (/\breset\b/.test(t)) {
-      const regs = dataSigs(known).length ? dataSigs(known) : dataSigs(sigs);
-      if (regs.length > 0) {
-        const req = mkReq(n, s, "reset", "After reset, " + regs.join(", ") + " must hold their reset values.");
-        buildReset(req, regs.slice(0, 8), ctx);
+      let vals = parseResetValues(s, known);
+      if (vals.length === 0) {
+        const regs = dataSigs(known);
+        vals = regs.slice(0, 8).map(function(g){ return { sig: g, expr: "(" + g + " == 0)" }; });
+      }
+      if (vals.length > 0) {
+        const req = mkReq(n, s, "reset", "After reset, " + vals.map(function(v){ return v.sig; }).join(", ") + " must hold their reset values.");
+        buildReset(req, vals, ctx);
         reqs.push(req);
         return;
       }
@@ -555,7 +755,7 @@ function buildRequirements(spec, known, ctx) {
       const A = clauseToExpr(m[1], known), B = clauseToExpr(m[2], known);
       if (A && B) {
         const req = mkReq(n, s, "until", m[1].trim() + " must hold on every cycle until " + m[2].trim() + ".");
-        buildUntil(req, A, B, ctx);
+        buildUntil(req, A, B, ctx, m[2]);
         reqs.push(req);
         return;
       }
@@ -569,7 +769,7 @@ function buildRequirements(spec, known, ctx) {
       if (A && C) {
         const req = mkReq(n, s, "implication",
           "If " + m[2].trim() + ", then " + m[3].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
-        buildImplication(req, A, C, timing, ctx);
+        buildImplication(req, A, C, timing, ctx, m[3]);
         reqs.push(req);
         return;
       }
@@ -583,7 +783,7 @@ function buildRequirements(spec, known, ctx) {
       if (X && Y) {
         const req = mkReq(n, s, "implication",
           subj + " holds only when " + m[4].trim() + ", so it implies " + m[4].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
-        buildImplication(req, X, Y, timing, ctx);
+        buildImplication(req, X, Y, timing, ctx, subj);
         reqs.push(req);
         return;
       }
@@ -594,7 +794,7 @@ function buildRequirements(spec, known, ctx) {
       const X = clauseToExpr(core, known);
       if (X) {
         const req = mkReq(n, s, "invariant", "This must never be true: " + X + ".");
-        buildInvariant(req, X, ctx);
+        buildInvariant(req, X, ctx, core);
         reqs.push(req);
         return;
       }
@@ -621,7 +821,7 @@ function buildRequirements(spec, known, ctx) {
       if (A && C) {
         const req = mkReq(n, s, "implication",
           "If " + m[3].trim() + ", then " + m[1].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
-        buildImplication(req, A, C, timing, ctx);
+        buildImplication(req, A, C, timing, ctx, m[1]);
         reqs.push(req);
         return;
       }
@@ -631,28 +831,44 @@ function buildRequirements(spec, known, ctx) {
     const timingG = extractTiming(t);
     if (E && timingG && timingG.op === "s_eventually") {
       const req = mkReq(n, s, "liveness", E + " must eventually become true.");
-      buildLiveness(req, E, ctx);
+      buildLiveness(req, E, ctx, s);
       reqs.push(req);
       return;
     }
     if (E) {
       const req = mkReq(n, s, "invariant", "Read as a condition that must always hold: " + E + ".");
-      buildInvariant(req, E, ctx);
+      buildInvariant(req, E, ctx, s);
       reqs.push(req);
       return;
     }
-    // fallback: honest skeleton
-    const req = mkReq(n, s, "draft", "The app could not map this sentence to your signals. Fill in the skeleton below, or add the signal names to the list on the left and generate again.");
-    buildTemplate(req, ctx, known);
-    reqs.push(req);
+    // nothing generated for anything still ambiguous: report it, do not fake it
+    skipped.push({ n: n, sentence: s, reason: "The app could not map this sentence to your declared signals. Add the signal names and explicit timing, then generate again." });
   });
-  return reqs;
+  return { reqs: reqs, skipped: skipped };
 }
 
 /* ---------- UI ---------- */
 
 let current = [];
+let currentSkipped = [];
+let currentNotes = [];
+let currentCtx = null;
 const $ = function(id){ return document.getElementById(id); };
+
+function makeCtx(gate) {
+  const rstEdge = gate.activeLow ? "negedge" : "posedge";
+  const event = gate.edge + " " + gate.clkName + (gate.sync ? "" : " or " + rstEdge + " " + gate.rstName);
+  const rstExpr = gate.activeLow ? "(!" + gate.rstName + ")" : gate.rstName;
+  const notRst = gate.activeLow ? gate.rstName : "(!" + gate.rstName + ")";
+  return {
+    clk: gate.clkName, edge: gate.edge, rst: gate.rstName,
+    activeLow: gate.activeLow, sync: gate.sync,
+    event: event,
+    dis: gate.sync ? "" : "disable iff " + rstExpr,
+    notRst: notRst,
+    signals: gate.signals, depth: gate.hdr.depth
+  };
+}
 
 function levelCode(tag) {
   const parts = [];
@@ -664,19 +880,108 @@ function levelCode(tag) {
   return parts.join("\n\n");
 }
 
+function renderGate(gate) {
+  const cards = $("cards");
+  cards.innerHTML = "";
+  $("emptyState").style.display = "none";
+  $("toolbar").style.display = "none";
+  const div = document.createElement("div");
+  div.className = "acard";
+  const head = document.createElement("div");
+  head.className = "ahead";
+  const strong = document.createElement("strong");
+  strong.textContent = "Spec completeness gate: " + gate.gaps.length + (gate.gaps.length === 1 ? " gap" : " gaps") + " to close";
+  head.appendChild(strong);
+  div.appendChild(head);
+  const note = document.createElement("div");
+  note.className = "understand";
+  note.textContent = "The app will not generate assertions from an underspecified spec. Fill in the gaps below and generate again, or proceed explicitly with the gaps.";
+  div.appendChild(note);
+  const cats = ["Clock", "Reset", "Signals", "Timing", "Consistency"];
+  cats.forEach(function(cat){
+    const items = gate.gaps.filter(function(g){ return g.cat === cat; });
+    if (!items.length) return;
+    const h = document.createElement("div");
+    h.className = "gapcat";
+    h.textContent = cat;
+    div.appendChild(h);
+    const ul = document.createElement("ul");
+    ul.className = "gaplist";
+    items.forEach(function(g){
+      const li = document.createElement("li");
+      li.textContent = g.msg;
+      ul.appendChild(li);
+    });
+    div.appendChild(ul);
+  });
+  if (gate.notes.length) {
+    const h = document.createElement("div");
+    h.className = "gapcat";
+    h.textContent = "Assumptions if you proceed";
+    div.appendChild(h);
+    const ul = document.createElement("ul");
+    ul.className = "gaplist";
+    gate.notes.forEach(function(n){
+      const li = document.createElement("li");
+      li.textContent = n;
+      ul.appendChild(li);
+    });
+    div.appendChild(ul);
+  }
+  const row = document.createElement("div");
+  row.className = "pad";
+  row.style.display = "flex";
+  row.style.gap = "8px";
+  const proceed = document.createElement("button");
+  proceed.className = "btn";
+  proceed.textContent = "Proceed anyway with " + gate.gaps.length + " gaps";
+  proceed.onclick = function(){ doGenerate(true); };
+  const edit = document.createElement("button");
+  edit.className = "btn small";
+  edit.textContent = "Back to the spec";
+  edit.onclick = function(){ $("spec").focus(); };
+  row.appendChild(proceed);
+  row.appendChild(edit);
+  div.appendChild(row);
+  const warn = document.createElement("div");
+  warn.className = "understand";
+  warn.textContent = "If you proceed, requirements that stay ambiguous will be skipped and listed, not generated.";
+  div.appendChild(warn);
+  cards.appendChild(div);
+}
+
 function render() {
   const cards = $("cards");
   cards.innerHTML = "";
-  const has = current.length > 0;
+  const has = current.length > 0 || currentSkipped.length > 0;
   $("emptyState").style.display = has ? "none" : "block";
-  $("toolbar").style.display = has ? "flex" : "none";
+  $("toolbar").style.display = current.length ? "flex" : "none";
   if (!has) return;
-  $("count").textContent = current.length + (current.length === 1 ? " requirement" : " requirements") + " found in your spec";
+  $("count").textContent = current.length + (current.length === 1 ? " requirement" : " requirements") + " generated" +
+    (currentSkipped.length ? ", " + currentSkipped.length + " skipped" : "");
+  if (currentNotes.length) {
+    const div = document.createElement("div");
+    div.className = "acard";
+    const head = document.createElement("div");
+    head.className = "ahead";
+    const strong = document.createElement("strong");
+    strong.textContent = "Assumptions used";
+    head.appendChild(strong);
+    div.appendChild(head);
+    const ul = document.createElement("ul");
+    ul.className = "gaplist";
+    currentNotes.forEach(function(n){
+      const li = document.createElement("li");
+      li.textContent = n;
+      ul.appendChild(li);
+    });
+    div.appendChild(ul);
+    cards.appendChild(div);
+  }
   const sets = [
     { tag: "Beginner", cls: "b", note: "The simplest checks for the whole spec, one per requirement." },
     { tag: "Intermediate", cls: "i", note: "The recommended set. Named properties with reset handled, ready for your testbench." },
-    { tag: "Advanced", cls: "a", note: "Sequence based forms with timing windows and cover points, for thorough checking." },
-    { tag: "Draft", cls: "i", note: "Sentences the app could not fully map to your signals. Fill in the marked spots." }
+    { tag: "Advanced", cls: "a", note: "Sequence based forms with timing windows and cover points, for thorough checking." }
   ];
   sets.forEach(function(set){
     const code = levelCode(set.tag);
@@ -687,7 +992,7 @@ function render() {
     head.className = "ahead";
     const tag = document.createElement("span");
     tag.className = "ltag " + set.cls;
-    tag.textContent = set.tag === "Draft" ? "To finish" : set.tag + " set";
+    tag.textContent = set.tag + " set";
     const copy = document.createElement("button");
     copy.className = "btn small";
     copy.textContent = "Copy";
@@ -710,28 +1015,63 @@ function render() {
     div.appendChild(pre);
     cards.appendChild(div);
   });
+  if (currentSkipped.length) {
+    const div = document.createElement("div");
+    div.className = "acard";
+    const head = document.createElement("div");
+    head.className = "ahead";
+    const strong = document.createElement("strong");
+    strong.textContent = "Skipped: nothing generated";
+    head.appendChild(strong);
+    div.appendChild(head);
+    const note = document.createElement("div");
+    note.className = "understand";
+    note.textContent = "These sentences were too ambiguous to turn into assertions, so the app generated nothing for them rather than guessing.";
+    div.appendChild(note);
+    const ul = document.createElement("ul");
+    ul.className = "gaplist";
+    currentSkipped.forEach(function(sk){
+      const li = document.createElement("li");
+      li.textContent = "Requirement " + sk.n + ": \"" + sk.sentence + "\" " + sk.reason;
+      ul.appendChild(li);
+    });
+    div.appendChild(ul);
+    cards.appendChild(div);
+  }
+}
+
+function portDecl(s) {
+  if (s.dir && s.type) return "  " + s.dir + " " + s.type + (s.width ? " " + s.width : "") + " " + s.name;
+  return "  logic " + s.name + " // direction and type not specified";
 }
 
 function recommendedSv() {
+  const clk = currentCtx ? currentCtx.clk : ($("clk").value.trim() || "clk");
+  const rst = currentCtx ? currentCtx.rst : ($("rst").value.trim() || "rst_n");
+  const sigs = currentCtx ? currentCtx.signals : [];
+  const ports = ["  input logic " + clk + ",", "  input logic " + rst + ","]
+    .concat(sigs.map(function(s){ return portDecl(s) + ","; }));
+  const last = ports[ports.length - 1].replace(/,$/, "");
+  ports[ports.length - 1] = last;
   const header =
     "// Generated by spec2sva from your spec text\n" +
     "// Recommended set: the Intermediate assertions.\n" +
-    "// Review every assertion before binding to your DUT.\n" +
-    "// Bind example: bind dut spec2sva_checks checks (.clk(clk), .rst_n(rst_n));\n\n" +
-    "module spec2sva_checks (\n" +
-    "  input logic " + $("clk").value.trim() + ",\n" +
-    "  input logic " + $("rst").value.trim() + "\n" +
-    ");\n\n";
+    "// Review every assertion before binding to your DUT.\n\n" +
+    "module spec2sva_checks (\n" + ports.join("\n") + "\n);\n\n";
   return header + levelCode("Intermediate") + "\n\nendmodule\n";
 }
 
-function doGenerate() {
-  const clk = ($("clk").value.trim() || "clk");
-  const rst = ($("rst").value.trim() || "rst_n");
-  const activeLow = $("rstlow").checked;
-  const ctx = { clk: clk, rst: rst, dis: "disable iff (" + (activeLow ? "!" + rst : rst) + ")" };
-  const known = parseSignals($("signals").value);
-  current = buildRequirements($("spec").value, known, ctx);
+function doGenerate(force) {
+  const gate = runGate($("spec").value, $("clk").value.trim(), $("rst").value.trim(), $("rstlow").checked);
+  if (gate.gaps.length > 0 && !force) {
+    renderGate(gate);
+    return;
+  }
+  currentCtx = makeCtx(gate);
+  const out = buildRequirements(gate.body, currentCtx);
+  current = out.reqs;
+  currentSkipped = out.skipped;
+  currentNotes = gate.notes;
   render();
 }
 
@@ -744,6 +1084,8 @@ document.querySelectorAll("[data-ex]").forEach(function(btn){
       $("spec").value = "";
       $("signals").value = "";
       current = [];
+      currentSkipped = [];
+      currentNotes = [];
       render();
       return;
     }
