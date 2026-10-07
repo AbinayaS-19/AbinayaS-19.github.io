@@ -207,6 +207,7 @@
     <textarea id="signals" placeholder="wr_en&#10;rd_en&#10;full&#10;empty"></textarea>
     <p class="hint">Signal names help the app read your spec. Put signal names in the spec too, exactly as listed here.</p>
     <button class="btn primary" id="gen">Generate assertions</button>
+    <button class="btn" id="shareLink" style="margin-top:8px">Copy link to this spec</button>
 
     <details class="ai">
       <summary>Optional: refine with your own AI model key</summary>
@@ -438,18 +439,20 @@ function atomExpr(clause, known) {
   let e = null;
   if (/\b(rises?|rose|rising edge|posedge)\b/.test(t)) e = "$rose(" + sig + ")";
   else if (/\b(falls?|fell|falling edge|negedge)\b/.test(t)) e = "$fell(" + sig + ")";
+  else if (/\b(must\s+not\s+change|does\s+not\s+change|do\s+not\s+change|cannot\s+change|never\s+changes?)\b/.test(t)) e = "$stable(" + sig + ")";
   else if (/\b(changes?|changed|toggles?|toggled|updates?|updated)\b/.test(t)) e = "$changed(" + sig + ")";
   else if (/\bincrements?\b/.test(t)) e = "(" + sig + " == $past(" + sig + ") + 1)";
   else if (/\bdecrements?\b/.test(t)) e = "(" + sig + " == $past(" + sig + ") - 1)";
-  else if (/\b(stable|unchanged|remains?|hold|holds|holding|must not change|does not change|do not change|constant)\b/.test(t)) e = "$stable(" + sig + ")";
   else {
     const m = t.match(/=\s*(0x[0-9a-f]+|\d+)/) || t.match(/\bequals?\s+(0x[0-9a-f]+|\d+)/);
     const negWord = /\bnot\b|\bn't\b|\bnever\b/.test(t);
+    let stableHit = false;
     if (m) e = "(" + sig + " == " + m[1] + ")";
+    else if (/\b(stable|unchanged|remains?|holds?|holding|constant|must\s+not\s+change|does\s+not\s+change|do\s+not\s+change)\b/.test(t) && !/\b(high|low|asserted|deasserted|active|inactive|enabled|disabled|set)\b/.test(t)) { e = "$stable(" + sig + ")"; stableHit = true; }
     else if (/\b(deasserted|deasserts?|low|goes low|drops?|is 0|inactive|disabled|cleared)\b/.test(t)) e = "(!" + sig + ")";
     else if (/\b(asserted|asserts?|high|goes high|is 1|active|enabled|set)\b/.test(t)) e = sig;
     else e = sig;
-    if (negWord && !m) e = (e.charAt(0) === "(" && e.charAt(1) === "!") ? e.slice(2, -1) : "(!" + e.replace(/^!\((.*)\)$/, "$1") + ")";
+    if (negWord && !m && !stableHit) e = (e.charAt(0) === "(" && e.charAt(1) === "!") ? e.slice(2, -1) : "(!" + e.replace(/^!\((.*)\)$/, "$1") + ")";
   }
   if (prev && e.charAt(0) !== "$") {
     const nm = e.match(/^!\((.+)\)$/);
@@ -557,12 +560,17 @@ function parseResetValues(sentence, known) {
 
 function buildImplication(req, A, C, timing, ctx, conClause) {
   const V = verbForClause(conClause || "", ctx);
-  const cop = timing && timing.op === "|=>" ? "|=>" : "|->";
+  let core;
+  if (timing && timing.op === "|=>") core = A + " |=> " + C;
+  else if (timing && timing.op === "s_eventually") core = A + " |-> s_eventually " + C;
+  else if (timing) core = A + " |-> " + timing.op + " " + C;
+  else core = A + " |-> " + C;
+  const when = timing ? timing.words : "the same cycle";
   addLevel(req, "Beginner", "b",
-    oneLiner(ctx, V.pre + "req" + req.n, V.kw, A + " " + cop + " " + C, req.sentence),
-    "The simplest form. Whenever the left side holds, the right side must hold " + (cop === "|=>" ? "in the next cycle." : "in the same cycle."));
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
+    "The simplest form. Whenever the left side holds, the right side must hold " + when + ".");
   addLevel(req, "Intermediate", "i",
-    propLines(ctx, "p_req" + req.n, A + " " + cop + " " + C, V.pre + "req" + req.n, V.kw),
+    propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
     "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench.");
   let advCore, coverCore;
   if (timing && timing.op !== "|=>" && timing.op !== "s_eventually") {
@@ -572,7 +580,8 @@ function buildImplication(req, A, C, timing, ctx, conClause) {
     advCore = A + " |-> s_eventually " + C;
     coverCore = A + " ##1 " + C;
   } else {
-    advCore = "s_req" + req.n + "_cause " + cop + " " + C;
+    const acop = timing && timing.op === "|=>" ? "|=>" : "|->";
+    advCore = "s_req" + req.n + "_cause " + acop + " " + C;
     coverCore = A + " ##1 " + C;
   }
   const D = ctx.dis ? " " + ctx.dis : "";
@@ -1163,18 +1172,41 @@ $("refine").onclick = function(){
   });
 };
 
-/* preload a sample so the page demonstrates itself immediately */
+/* preload: a shared link (?spec=...) wins, otherwise the FIFO sample */
 try {
   (function(){
-    const ex = EXAMPLES.fifo;
-    $("spec").value = ex.spec;
-    $("signals").value = ex.signals;
+    let qs = null;
+    try { qs = new URLSearchParams(window.location.search); } catch (e) { qs = null; }
+    if (qs && (qs.has("spec") || qs.has("signals"))) {
+      if (qs.get("spec")) $("spec").value = qs.get("spec");
+      if (qs.get("signals")) $("signals").value = qs.get("signals");
+      if (qs.get("clk")) $("clk").value = qs.get("clk");
+      if (qs.get("rst")) $("rst").value = qs.get("rst");
+      if (qs.get("rstlow")) $("rstlow").checked = qs.get("rstlow") === "1";
+    } else {
+      const ex = EXAMPLES.fifo;
+      $("spec").value = ex.spec;
+      $("signals").value = ex.signals;
+    }
     doGenerate();
   })();
 } catch (err) {
   $("emptyState").style.display = "block";
   $("emptyState").textContent = "Something went wrong loading the app (" + (err.message || "unknown error") + "). Try reloading the page.";
 }
+
+$("shareLink").onclick = function(){
+  const q = "?spec=" + encodeURIComponent($("spec").value) +
+    "&signals=" + encodeURIComponent($("signals").value) +
+    "&clk=" + encodeURIComponent($("clk").value.trim()) +
+    "&rst=" + encodeURIComponent($("rst").value.trim()) +
+    "&rstlow=" + ($("rstlow").checked ? "1" : "0");
+  const url = window.location.origin + window.location.pathname + q;
+  const btn = $("shareLink");
+  const done = function(){ btn.textContent = "Copied"; setTimeout(function(){ btn.textContent = "Copy link to this spec"; }, 1500); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, done);
+  else done();
+};
 </script>
 </body>
 </html>
