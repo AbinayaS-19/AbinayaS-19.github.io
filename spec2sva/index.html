@@ -129,6 +129,9 @@
   .gapcat { font-size: 13px; font-weight: 700; margin: 12px 14px 4px; }
   .gaplist { margin: 0 14px 10px; padding-left: 20px; font-size: 13px; }
   .gaplist li { margin-bottom: 5px; }
+  .tabs { display: flex; gap: 6px; margin: 4px 0 10px; }
+  .tab { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; color: var(--ink); }
+  .tab.active { background: var(--ink); color: #fff; border-color: var(--ink); }
   .lvl {
     margin: 12px 14px 0;
     border: 1px solid var(--line);
@@ -178,7 +181,7 @@
 <body>
 <header>
   <h1>spec<span>2</span>sva</h1>
-  <p>Type any spec. Get beginner, intermediate, and advanced assertion variations for every requirement it states. A completeness gate checks clock, reset, signal directions, and timing before anything is generated.</p>
+  <p>Type a spec and get beginner, intermediate, and advanced assertions. Or paste a WaveDrom waveform and get assertions from its edges. Or paste assertions and get plain English back. A completeness gate checks clock, reset, signal directions, and timing before anything is generated.</p>
 </header>
 <main>
   <section class="panel">
@@ -190,8 +193,27 @@
       <button class="btn small" data-ex="clear">Clear</button>
     </div>
     <p class="hint">Sample specs to try, or type your own below. Whatever you type, the app drafts fresh assertions from your words. Nothing is prebuilt.</p>
+    <div class="tabs">
+      <button class="tab active" data-tab="spec">Spec text</button>
+      <button class="tab" data-tab="wave">Waveform</button>
+      <button class="tab" data-tab="explain">Explain SVA</button>
+    </div>
+    <div id="pane-spec">
     <label for="spec">Spec text</label>
     <textarea id="spec" placeholder="Type or paste your spec here. One requirement per line or sentence works best. Example: When wr_en is high and full is low, the write pointer increments in the next cycle."></textarea>
+    </div>
+    <div id="pane-wave" style="display:none">
+    <label for="wave">Waveform (WaveDrom JSON)</label>
+    <textarea id="wave" placeholder='{"signal": [{"name": "clk", "wave": "p........."}, {"name": "req", "wave": "0.1....0.."}, {"name": "ack", "wave": "0...11..0."}]}'></textarea>
+    <p class="hint">Paste WaveDrom JSON. The app reads the edges, writes down the requirements it sees, and generates assertions from them.</p>
+    <div id="waveReqs" class="understand" style="display:none"></div>
+    </div>
+    <div id="pane-explain" style="display:none">
+    <label for="svaIn">SystemVerilog assertions</label>
+    <textarea id="svaIn" placeholder="Paste assertions here, e.g. a_req1 : assert property (@(posedge clk) $rose(req) |-> ##[1:3] $rose(ack));"></textarea>
+    <p class="hint">The reverse direction: plain English explanations of what each assertion checks.</p>
+    <button class="btn primary" id="explainBtn" style="margin-top:8px">Explain in plain English</button>
+    </div>
     <div class="row">
       <div>
         <label for="clk">Clock</label>
@@ -702,6 +724,294 @@ function buildUntil(req, A, B, ctx, clause) {
 <script>
 "use strict";
 
+/* ---------- reverse: SVA to plain English ---------- */
+
+function stripOuter(e) {
+  let prev;
+  do {
+    prev = e;
+    e = stripOnce(e);
+  } while (e !== prev);
+  return e;
+}
+
+function stripOnce(e) {
+  e = e.trim();
+  if (e.charAt(0) !== "(") return e;
+  let d = 0;
+  for (let i = 0; i < e.length; i++) {
+    if (e.charAt(i) === "(") d++;
+    else if (e.charAt(i) === ")") { d--; if (d === 0) return i === e.length - 1 ? e.slice(1, -1).trim() : e; }
+  }
+  return e;
+}
+
+function splitTopLevel(e, token) {
+  let d = 0;
+  for (let i = 0; i <= e.length - token.length; i++) {
+    const c = e.charAt(i);
+    if (c === "(") d++;
+    else if (c === ")") d--;
+    else if (d === 0 && e.substr(i, token.length) === token) return [e.slice(0, i).trim(), e.slice(i + token.length).trim(), token];
+  }
+  return null;
+}
+
+function splitAllTop(e, token) {
+  const parts = [];
+  let rest = e, sp;
+  while ((sp = splitTopLevel(rest, token)) !== null) { parts.push(sp[0]); rest = sp[1]; }
+  parts.push(rest);
+  return parts;
+}
+
+function exprEn(e) {
+  e = stripOuter(e.trim());
+  let m;
+  if (m = e.match(/^\$rose\((\w+)\)$/)) return m[1] + " rises";
+  if (m = e.match(/^\$fell\((\w+)\)$/)) return m[1] + " falls";
+  if (m = e.match(/^\$stable\((\w+)\)$/)) return m[1] + " stays stable";
+  if (m = e.match(/^\$changed\((\w+)\)$/)) return m[1] + " changes";
+  if (m = e.match(/^\(?\s*(\w+)\s*==\s*\$past\(\1\)\s*\+\s*1\s*\)?$/)) return m[1] + " increments";
+  if (m = e.match(/^\(?\s*(\w+)\s*==\s*\$past\(\1\)\s*-\s*1\s*\)?$/)) return m[1] + " decrements";
+  if (m = e.match(/^\$past\((\w+)\)$/)) return "the previous value of " + m[1];
+  if (m = e.match(/^!\$isunknown\((\w+)\)$/)) return m[1] + " is not X";
+  if (m = e.match(/^\$onehot0\(\{\s*([\w\s,]+?)\s*\}\)$/)) return "at most one of " + m[1].trim().replace(/\s*,\s*/g, ", ") + " is high";
+  if (m = e.match(/^\$onehot\(\{\s*([\w\s,]+?)\s*\}\)$/)) return "exactly one of " + m[1].trim().replace(/\s*,\s*/g, ", ") + " is high";
+  if (m = e.match(/^\$onehot\((\w+)\)$/)) return m[1] + " is high";
+  if (m = e.match(/^\(?\s*(\w+)\s*==\s*(0x[0-9a-fA-F]+|\d+)\s*\)?$/)) return m[1] + " equals " + m[2];
+  if (m = e.match(/^not\s+(\w+)$/)) return "the " + m[1] + " scenario never happens";
+  if (m = e.match(/^!\(?\s*(\w+)\s*\)?$/)) return m[1] + " is low";
+  if (/^\w+$/.test(e)) return e + " is high";
+  if ((m = e.match(/^([\s\S]*?)\s+s_until_with\s+([\s\S]*)$/))) {
+    const a = exprEn(m[1]), b = exprEn(m[2]);
+    if (a === null || b === null) return null;
+    return a.replace(/ is high$/, " holds") + " strongly until " + b;
+  }
+  if ((m = e.match(/^([\s\S]*?)\s+until\s+([\s\S]*)$/))) {
+    const a = exprEn(m[1]), b = exprEn(m[2]);
+    if (a === null || b === null) return null;
+    return a.replace(/ is high$/, " holds") + " until " + b;
+  }
+  let parts = splitAllTop(e, "&&");
+  if (parts.length > 1) {
+    const ps = parts.map(exprEn);
+    return ps.indexOf(null) >= 0 ? null : ps.join(" and ");
+  }
+  parts = splitAllTop(e, "||");
+  if (parts.length > 1) {
+    const ps = parts.map(exprEn);
+    return ps.indexOf(null) >= 0 ? null : ps.join(" or ");
+  }
+  if (e.charAt(0) === "!") {
+    const inner = exprEn(e.slice(1));
+    return inner === null ? null : "it is not the case that " + inner;
+  }
+  return null;
+}
+
+function checksEn(s) {
+  const parts = splitAllTop(s, "&&");
+  return parts.map(function(p){
+    p = stripOuter(p.trim());
+    let m;
+    if (m = p.match(/^\(\s*(\w+)\s*==\s*(0x[0-9a-fA-F]+|\d+)\s*\)$/)) return m[1] + " is " + m[2];
+    if (m = p.match(/^!\(\s*(\w+)\s*\)$/)) return m[1] + " is low";
+    if (/^\w+$/.test(p)) return p + " is high";
+    const e = exprEn(p);
+    return e === null ? p : e;
+  }).join(" and ");
+}
+
+function coreBodyEn(c) {
+  c = c.trim();
+  let m;
+  // synchronous-reset guard wrapper: (rst) |-> (IMPLICATION)
+  if ((m = c.match(/^\((!?\w+|!\(\w+\))\)\s*(\|->|\|=>)\s*\(([\s\S]+)\)$/)) &&
+      (m[3].indexOf("|->") >= 0 || m[3].indexOf("|=>") >= 0)) {
+    const inner = coreBodyEn(m[3]);
+    return inner === null ? null : "when not in reset, " + inner;
+  }
+  // reset values
+  if ((m = c.match(/^\$(fell|rose)\(\w+\)\s*\|->\s*##1\s*\(([\s\S]+)\)$/))) {
+    return "one cycle after reset, " + checksEn(m[2]);
+  }
+  if ((m = c.match(/^\([^()]*\)\s*##1\s*\([^()]*\)\s*\|->\s*##1\s*\(([\s\S]+)\)$/))) {
+    return "one cycle after reset deasserts, " + checksEn(m[1]);
+  }
+  // never: !(...)
+  if (c.charAt(0) === "!" && c.charAt(1) !== "$") {
+    const inner = exprEn(c.slice(1));
+    return inner === null ? null : "it is never true that " + inner;
+  }
+  // implication
+  const sp = splitTopLevel(c, "|=>") || splitTopLevel(c, "|->");
+  if (sp) {
+    const Aen = exprEn(sp[0]);
+    let rest = sp[1].trim(), ten;
+    const tm = rest.match(/^(##\[1:(\d+)\]|##(\d+)|s_eventually)\s+([\s\S]+)$/);
+    if (tm) {
+      if (tm[1].charAt(2) === "[") ten = "within " + tm[2] + " cycles";
+      else if (tm[1] === "s_eventually") ten = "eventually";
+      else ten = tm[3] + " cycles later";
+      rest = tm[4];
+    } else {
+      ten = sp[2] === "|=>" ? "in the next cycle" : "in the same cycle";
+    }
+    const Ben = exprEn(rest);
+    if (Aen === null || Ben === null) return null;
+    return "when " + Aen + ", " + Ben + " " + ten;
+  }
+  // standalone eventually
+  if ((m = c.match(/^s_eventually\s*\(([\s\S]+)\)$/))) {
+    const e = exprEn(m[1]);
+    return e === null ? null : e + " eventually happens";
+  }
+  // bare boolean core
+  const e = exprEn(c);
+  return e === null ? null : e + " always holds";
+}
+
+function coverEn(core) {
+  const c = core.trim();
+  const sp = splitTopLevel(c, "|=>") || splitTopLevel(c, "|->");
+  if (!sp) {
+    const tm = c.match(/^([\s\S]+?)\s*##1\s*([\s\S]+)$/);
+    if (tm) {
+      const a = exprEn(tm[1]), b = exprEn(tm[2]);
+      if (a !== null && b !== null) return "Cover point: it must be possible that after " + a + ", " + b + ".";
+    }
+    return null;
+  }
+  const body = coreBodyEn(c);
+  return body === null ? null : "Cover point: it must be possible that " + body + ".";
+}
+
+function explainSva(src) {
+  const results = [];
+  let text = "\n" + String(src).replace(/\/\/[^\n]*/g, "") + "\n";
+  const clockRe = "@\\(\\s*(?:posedge|negedge)\\s+\\w+(?:\\s+or\\s+(?:posedge|negedge)\\s+\\w+)?\\s*\\)";
+  const propRe = new RegExp(
+    "property\\s+(\\w+)\\s*;\\s*" + clockRe +
+    "\\s*(disable\\s+iff\\s*\\([^;]*?\\))?\\s*([\\s\\S]*?);\\s*endproperty" +
+    "\\s*(\\w+)\\s*:\\s*(assert|assume|cover)\\s+property\\s*\\(\\s*\\1\\s*\\)\\s*;",
+    "gi");
+  text = text.replace(propRe, function(m, pname, dis, core, vname, verb){
+    results.push({ label: vname + " : " + verb + " property (" + pname + ")", verb: verb, core: core.trim(), reset: !!dis });
+    return "\n";
+  });
+  const oneRe = new RegExp(
+    "(\\w+)\\s*:\\s*(assert|assume|cover)\\s+property\\s*\\(" + clockRe +
+    "\\s*(disable\\s+iff\\s*\\([^)]*\\))?\\s*([\\s\\S]*?)\\)\\s*;",
+    "gi");
+  let m2;
+  while ((m2 = oneRe.exec(text)) !== null) {
+    results.push({ label: m2[1] + " : " + m2[2] + " property (...)", verb: m2[2], core: m2[4].trim(), reset: !!m2[3] });
+  }
+  if (!results.length) {
+    const t = String(src).replace(/\/\/[^\n]*/g, "").trim();
+    if (t) results.push({ label: "(pasted code)", verb: "assert", core: t, reset: false });
+  }
+  results.forEach(function(r){
+    let body;
+    if (r.verb === "cover") body = coverEn(r.core);
+    else body = coreBodyEn(r.core);
+    if (body === null) {
+      r.english = "This one uses a form the explainer does not cover yet.";
+      return;
+    }
+    if (r.verb === "assume") r.english = "The testbench must ensure that " + body + ".";
+    else if (r.verb === "cover") r.english = body;
+    else r.english = "The design must guarantee that " + body + ".";
+    if (r.reset && r.verb !== "cover") r.english += " It is not checked during reset.";
+  });
+  return results;
+}
+
+/* ---------- waveform (WaveDrom JSON) to requirements ---------- */
+
+function wavedromToSpec(text, clkName, rstName) {
+  let obj;
+  try { obj = JSON.parse(text); }
+  catch (e) { return { error: "That is not valid JSON: " + e.message }; }
+  const sigs = obj.signal || obj.signals;
+  if (!sigs || !sigs.length) return { error: "No signal array found. Use WaveDrom format: {\"signal\": [{\"name\": ..., \"wave\": ...}]}" };
+  const traces = [];
+  sigs.forEach(function(s){
+    if (!s || !s.name || !s.wave) return;
+    const vals = [];
+    let prev = "x";
+    String(s.wave).split("").forEach(function(ch){
+      let v = ch;
+      if (ch === "." || ch === "|") v = prev;
+      else if (ch === "p" || ch === "n") v = "c";
+      prev = v;
+      vals.push(v);
+    });
+    traces.push({ name: s.name, vals: vals });
+  });
+  if (!traces.length) return { error: "No usable waves found." };
+  const n = Math.max.apply(null, traces.map(function(t){ return t.vals.length; }));
+  traces.forEach(function(t){ while (t.vals.length < n) t.vals.push(t.vals[t.vals.length - 1]); });
+  const hi = function(v){ return v === "1" || v === "h" || v === "d"; };
+  const lo = function(v){ return v === "0" || v === "l"; };
+  const edges = {};
+  traces.forEach(function(tr){
+    if (tr.name === clkName) return;
+    const list = [];
+    for (let i = 1; i < n; i++) {
+      if (lo(tr.vals[i - 1]) && hi(tr.vals[i])) list.push({ cycle: i, type: "rise" });
+      else if (hi(tr.vals[i - 1]) && lo(tr.vals[i])) list.push({ cycle: i, type: "fall" });
+    }
+    edges[tr.name] = list;
+  });
+  const names = Object.keys(edges);
+  const seen = {};
+  const reqs = [];
+  function add(r){ if (!seen[r] && reqs.length < 10) { seen[r] = 1; reqs.push(r); } }
+  function within(d){ return d === 1 ? "in the next cycle" : "within " + d + " cycles"; }
+  names.forEach(function(a){
+    names.forEach(function(b){
+      if (a === b) return;
+      ["rise", "fall"].forEach(function(ty){
+        const verb = ty === "rise" ? "rises" : "falls";
+        let best = null;
+        edges[a].forEach(function(e){
+          if (e.type !== ty) return;
+          edges[b].forEach(function(x){
+            if (x.type === ty && x.cycle > e.cycle) {
+              const d = x.cycle - e.cycle;
+              if (d >= 1 && d <= 16 && (best === null || d < best)) best = d;
+            }
+          });
+        });
+        if (best !== null) add("When " + a + " " + verb + ", " + b + " " + verb + " " + within(best) + ".");
+      });
+    });
+  });
+  names.forEach(function(a){
+    names.forEach(function(b){
+      if (a === b) return;
+      const trA = traces.filter(function(t){ return t.name === a; })[0];
+      let ok = false;
+      edges[a].forEach(function(e){
+        if (e.type !== "rise") return;
+        const br = edges[b].filter(function(x){ return x.type === "rise" && x.cycle > e.cycle; })[0];
+        if (!br) return;
+        let held = true;
+        for (let i = e.cycle; i < br.cycle; i++) { if (!hi(trA.vals[i])) { held = false; break; } }
+        if (held) ok = true;
+      });
+      if (ok) add(a + " remains high until " + b + " rises.");
+    });
+  });
+  if (!reqs.length) return { error: "No edge relationships found in the waves. Make sure signals toggle between 0 and 1." };
+  const spec = "Clock: " + clkName + ", posedge\nReset: " + rstName + ", active low, asynchronous\n\n" +
+    "Requirements (all sampled on posedge clk):\n" +
+    reqs.map(function(r, i){ return "  " + (i + 1) + ". " + r; }).join("\n");
+  return { spec: spec, reqs: reqs };
+}
+
 /* ---------- requirement dispatcher ---------- */
 
 function parseSignals(text) {
@@ -1070,8 +1380,9 @@ function recommendedSv() {
   return header + levelCode("Intermediate") + "\n\nendmodule\n";
 }
 
-function doGenerate(force) {
-  const gate = runGate($("spec").value, $("clk").value.trim(), $("rst").value.trim(), $("rstlow").checked);
+function doGenerate(force, specOverride) {
+  const specText = specOverride !== undefined ? specOverride : $("spec").value;
+  const gate = runGate(specText, $("clk").value.trim(), $("rst").value.trim(), $("rstlow").checked);
   if (gate.gaps.length > 0 && !force) {
     renderGate(gate);
     return;
@@ -1084,7 +1395,80 @@ function doGenerate(force) {
   render();
 }
 
-$("gen").onclick = doGenerate;
+let activeTab = "spec";
+function setTab(t) {
+  activeTab = t;
+  const tabs = document.querySelectorAll(".tab");
+  for (let i = 0; i < tabs.length; i++) {
+    tabs[i].className = "tab" + (tabs[i].getAttribute("data-tab") === t ? " active" : "");
+  }
+  ["spec", "wave", "explain"].forEach(function(k){
+    $("pane-" + k).style.display = k === t ? "block" : "none";
+  });
+}
+
+(function(){
+  const tabs = document.querySelectorAll(".tab");
+  for (let i = 0; i < tabs.length; i++) {
+    tabs[i].onclick = function(){ setTab(tabs[i].getAttribute("data-tab")); };
+  }
+})();
+
+function showWaveMsg(msg) {
+  const el = $("waveReqs");
+  el.style.display = "block";
+  el.textContent = msg;
+}
+
+$("gen").onclick = function(){
+  if (activeTab === "wave") {
+    const r = wavedromToSpec($("wave").value, $("clk").value.trim() || "clk", $("rst").value.trim() || "rst_n");
+    if (r.error) { showWaveMsg(r.error); return; }
+    showWaveMsg("Read from the waveform: " + r.reqs.join(" "));
+    doGenerate(false, r.spec);
+    return;
+  }
+  if (activeTab === "explain") { $("explainBtn").click(); return; }
+  doGenerate(false);
+};
+
+$("explainBtn").onclick = function(){
+  const items = explainSva($("svaIn").value);
+  renderExplanations(items);
+};
+
+function renderExplanations(items) {
+  const cards = $("cards");
+  cards.innerHTML = "";
+  $("emptyState").style.display = "none";
+  $("toolbar").style.display = "none";
+  if (!items.length) {
+    $("emptyState").style.display = "block";
+    $("emptyState").textContent = "Paste some assertions above and press Explain.";
+    return;
+  }
+  items.forEach(function(it, idx){
+    const div = document.createElement("div");
+    div.className = "acard";
+    const head = document.createElement("div");
+    head.className = "ahead";
+    const strong = document.createElement("strong");
+    strong.textContent = "Explanation " + (idx + 1);
+    head.appendChild(strong);
+    div.appendChild(head);
+    const eng = document.createElement("div");
+    eng.className = "understand";
+    eng.style.fontSize = "14px";
+    eng.textContent = it.english;
+    div.appendChild(eng);
+    const pre = document.createElement("pre");
+    const codeEl = document.createElement("code");
+    codeEl.textContent = it.label;
+    pre.appendChild(codeEl);
+    div.appendChild(pre);
+    cards.appendChild(div);
+  });
+}
 
 document.querySelectorAll("[data-ex]").forEach(function(btn){
   btn.onclick = function(){
@@ -1183,6 +1567,13 @@ try {
       if (qs.get("clk")) $("clk").value = qs.get("clk");
       if (qs.get("rst")) $("rst").value = qs.get("rst");
       if (qs.get("rstlow")) $("rstlow").checked = qs.get("rstlow") === "1";
+    } else if (qs && qs.get("mode") === "wave") {
+      setTab("wave");
+      if (qs.get("wave")) $("wave").value = qs.get("wave");
+      if (qs.get("clk")) $("clk").value = qs.get("clk");
+      if (qs.get("rst")) $("rst").value = qs.get("rst");
+      if (qs.get("rstlow")) $("rstlow").checked = qs.get("rstlow") === "1";
+      return;
     } else {
       const ex = EXAMPLES.fifo;
       $("spec").value = ex.spec;
