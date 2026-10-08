@@ -373,7 +373,7 @@
 
 const EXAMPLES = {
   fifo: {
-    spec: "Clock: clk, posedge\nReset: rst_n, active low, asynchronous\nDepth: 16\n\nSignals:\n  wr_en  : input  logic        ; driven by testbench\n  rd_en  : input  logic        ; driven by testbench\n  din    : input  logic [7:0]  ; driven by testbench\n  full   : output logic        ; guaranteed by DUT\n  empty  : output logic        ; guaranteed by DUT\n  dout   : output logic [7:0]  ; guaranteed by DUT\n  wr_ptr : output logic [3:0]  ; guaranteed by DUT\n  rd_ptr : output logic [3:0]  ; guaranteed by DUT\n\nRequirements (all sampled on posedge clk):\n  1. When wr_en is high and full is low, wr_ptr increments in the next cycle.\n  2. When full is high, wr_ptr must remain stable in the next cycle.\n  3. full and empty are never high at the same time.\n  4. When rd_en is high and empty is low, dout updates in the next cycle and rd_ptr increments in the next cycle.\n  5. When wr_en is high and full is low, full is low in the same cycle.\n  6. When rd_en is high and empty is low, empty is low in the same cycle.\n  7. After reset, wr_ptr is 0, rd_ptr is 0, full is low, and empty is high.",
+    spec: "Clock: clk, posedge\nReset: rst_n, active low, asynchronous\nDepth: 16\n\nSignals:\n  wr_en  : input  logic        ; driven by testbench\n  rd_en  : input  logic        ; driven by testbench\n  din    : input  logic [7:0]  ; driven by testbench\n  full   : output logic        ; guaranteed by DUT\n  empty  : output logic        ; guaranteed by DUT\n  dout   : output logic [7:0]  ; guaranteed by DUT\n  wr_ptr : output logic [3:0]  ; guaranteed by DUT\n  rd_ptr : output logic [3:0]  ; guaranteed by DUT\n\nRequirements (all sampled on posedge clk):\n  1. When wr_en is high and full is low, wr_ptr increments in the next cycle.\n  2. When full is high, wr_ptr must remain stable in the next cycle.\n  3. full and empty are never high at the same time.\n  4. When rd_en is high and empty is low, rd_ptr increments in the next cycle.\n  5. When wr_en is high and full is high, wr_ptr must remain stable in the next cycle.\n  6. When rd_en is high and empty is high, rd_ptr must remain stable in the next cycle.\n  7. After reset, wr_ptr is 0, rd_ptr is 0, full is low, and empty is high.",
     signals: "wr_en\nrd_en\ndin\nfull\nempty\ndout\nwr_ptr\nrd_ptr"
   },
   apb: {
@@ -602,6 +602,57 @@ function extractSignals(sentence, known) {
 
 /* ---------- clause -> SVA boolean expression ---------- */
 
+/* ---------- SystemVerilog literal support ---------- */
+
+// Sized, unbased, and plain literals. Sized and unbased forms come first so
+// "8'hA5" is never reduced to its numeric prefix "8".
+const SVLIT_SRC = "(\\d+'[sS]?[bB][01xXzZ?_]+|\\d+'[sS]?[oO][0-7xXzZ?_]+|\\d+'[sS]?[dD][0-9xXzZ?_]+|\\d+'[sS]?[hH][0-9a-fA-FxXzZ?_]+|'[bB][01xXzZ?_]+|'[oO][0-7xXzZ?_]+|'[dD][0-9xXzZ?_]+|'[hH][0-9a-fA-FxXzZ?_]+|0[xX][0-9a-fA-F]+|-?\\d+)";
+let litWarnings = [];
+
+// Find a value literal in a clause, preserving the original text and case.
+// Matches "= <lit>" and "<verb> <lit>" where verb is equals/equal to/be/is/etc.
+function findLiteral(clause) {
+  const c = clause.replace(/\bzero\b/gi, "0");
+  let m = c.match(new RegExp("=\\s*" + SVLIT_SRC + "(?![\\w'])", "i"));
+  if (m) return normLiteral(m[1]);
+  m = c.match(new RegExp("\\b(?:equals?|equal\\s+to|be|is|reaches?|reached|hits?)\\s*" + SVLIT_SRC + "(?![\\w'])", "i"));
+  if (m) return normLiteral(m[1]);
+  return null;
+}
+
+// Normalize C-style 0x to SystemVerilog 'h form; warn so it is never silent.
+function normLiteral(lit) {
+  if (/^0[xX][0-9a-fA-F]+$/.test(lit)) {
+    litWarnings.push("C-style literal " + lit + " normalized to SystemVerilog '" + lit.slice(2) + " form.");
+    return "'h" + lit.slice(2);
+  }
+  return lit;
+}
+
+// Validate a sized literal's width without silently modifying the value.
+function checkLiteralWidth(lit) {
+  const m = lit.match(/^(\d+)'[sS]?[bB]([01xXzZ?_]+)$/) ||
+            lit.match(/^(\d+)'[sS]?[oO]([0-7xXzZ?_]+)$/) ||
+            lit.match(/^(\d+)'[sS]?[dD]([0-9xXzZ?_]+)$/) ||
+            lit.match(/^(\d+)'[sS]?[hH]([0-9a-fA-FxXzZ?_]+)$/);
+  if (!m) return;
+  const digits = m[2].replace(/[_?]/g, "");
+  if (/[xXzZ]/.test(digits)) return; // unknown bits: width check not meaningful
+  const low = lit.toLowerCase();
+  const base = low.indexOf("'b") >= 0 ? 2 : low.indexOf("'o") >= 0 ? 8 : low.indexOf("'d") >= 0 ? 10 : 16;
+  const val = parseInt(digits, base);
+  if (isNaN(val)) return;
+  const need = val === 0 ? 1 : Math.floor(Math.log2(val)) + 1;
+  if (need > +m[1]) litWarnings.push("Literal " + lit + " needs " + need + " bits but declares " + m[1] + "; the value is preserved as written. Check the width.");
+}
+
+function drainLitWarnings(req) {
+  if (litWarnings.length) {
+    req.levels.forEach(function(lv){ lv.note += " " + litWarnings.join(" "); });
+    litWarnings.length = 0;
+  }
+}
+
 function atomExpr(clause, known) {
   const sig = findSignalIn(clause, known);
   if (!sig) return null;
@@ -615,7 +666,7 @@ function atomExpr(clause, known) {
   if (/\b(rises?|rose|rising edge|posedge|goes?\s+high|go\s+high|comes?\s+up)\b/.test(t)) e = negEdge ? "!$rose(" + sig + ")" : "$rose(" + sig + ")";
   else if (/\b(falls?|fell|falling edge|negedge|goes?\s+low|go\s+low)\b/.test(t)) e = negEdge ? "!$fell(" + sig + ")" : "$fell(" + sig + ")";
   else if (/\b(must\s+not\s+change|does\s+not\s+change|do\s+not\s+change|cannot\s+change|never\s+changes?)\b/.test(t)) e = "$stable(" + sig + ")";
-  else if (/\b(changes?|changed|toggles?|toggled|updates?|updated)\b/.test(t)) e = "$changed(" + sig + ")";
+  else if (/\b(changes?|changed|toggles?|toggled)\b/.test(t)) e = "$changed(" + sig + ")";
   else if (/\bincrements?\b/.test(t)) {
     const im = t.match(/\bincrements?\s+by\s+(\d+)/);
     e = "(" + sig + " == $past(" + sig + ") + " + (im ? im[1] : "1") + ")";
@@ -629,7 +680,8 @@ function atomExpr(clause, known) {
     if (/\bnot\b|\bn't\b|\bnever\b/.test(t)) e = "(!" + e + ")";
   }
   else {
-    const m = t.match(/=\s*(0x[0-9a-f]+|\d+)/) || t.match(/\b(?:equals?|reaches?|reached|hits?)\s+(0x[0-9a-f]+|\d+)/);
+    const lit = findLiteral(clause);
+    if (lit) checkLiteralWidth(lit);
     const negWord = /\bnot\b|\bn't\b|\bnever\b/.test(t);
     let stableHit = false;
     let sigEq = null;
@@ -638,14 +690,14 @@ function atomExpr(clause, known) {
       const w = meq[1].toLowerCase();
       known.forEach(function(k){ if (baseName(k).toLowerCase() === w && baseName(k).toLowerCase() !== baseName(sig).toLowerCase()) sigEq = k; });
     }
-    if (m) e = "(" + sig + " == " + m[m.length - 1] + ")";
+    if (lit) e = negWord ? "(" + sig + " != " + lit + ")" : "(" + sig + " == " + lit + ")";
     else if (sigEq) e = "(" + sig + " == " + sigEq + ")";
     else if (/\b(x|unknown)\b/.test(t)) e = "$isunknown(" + sig + ")";
     else if (/\b(stable|unchanged|remains?|holds?|holding|constant|must\s+not\s+change|does\s+not\s+change|do\s+not\s+change)\b/.test(t) && !/\b(high|low|asserted|deasserted|active|inactive|enabled|disabled|set)\b/.test(t)) { e = "$stable(" + sig + ")"; stableHit = true; }
     else if (/\b(deasserted|deasserts?|low|goes low|drops?|is 0|inactive|disabled|cleared)\b/.test(t)) e = "(!" + sig + ")";
     else if (/\b(asserted|asserts?|high|goes high|is 1|active|enabled|set)\b/.test(t)) e = sig;
     else e = sig;
-    if (negWord && !m && !stableHit) e = (e.charAt(0) === "(" && e.charAt(1) === "!") ? e.slice(2, -1) : "(!" + e.replace(/^!\((.*)\)$/, "$1") + ")";
+    if (negWord && !lit && !stableHit) e = (e.charAt(0) === "(" && e.charAt(1) === "!") ? e.slice(2, -1) : "(!" + e.replace(/^!\((.*)\)$/, "$1") + ")";
   }
   if (prev && e.charAt(0) !== "$") {
     const nm = e.match(/^!\((.+)\)$/);
@@ -685,10 +737,36 @@ function extractTiming(lower) {
   lower = lower.replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\b/g, function(w){
     return { one: "1", two: "2", three: "3", four: "4", five: "5", six: "6", seven: "7", eight: "8", nine: "9", ten: "10" }[w];
   });
-  let m = lower.match(/within\s+(\d+)\s+cycles?/);
-  if (m) return { op: "##[1:" + m[1] + "]", words: "within " + m[1] + " cycles" };
+  let m = lower.match(/between\s+(\d+)\s+and\s+(\d+)\s+cycles?/);
+  if (m) {
+    const lo = +m[1], hi = +m[2];
+    if (lo > hi) return { invalid: "Range bounds are reversed in 'between " + lo + " and " + hi + " cycles'. Write the smaller bound first." };
+    return { op: "##[" + lo + ":" + hi + "]", words: "between " + lo + " and " + hi + " cycles" };
+  }
+  m = lower.match(/within\s+(\d+)\s+to\s+(\d+)\s+cycles?/);
+  if (m) {
+    const lo = +m[1], hi = +m[2];
+    if (lo > hi) return { invalid: "Range bounds are reversed in 'within " + lo + " to " + hi + " cycles'. Write the smaller bound first." };
+    return { op: "##[" + lo + ":" + hi + "]", words: "within " + lo + " to " + hi + " cycles" };
+  }
+  m = lower.match(/(\d+)\s+to\s+(\d+)\s+cycles?\s+later/);
+  if (m) {
+    const lo = +m[1], hi = +m[2];
+    if (lo > hi) return { invalid: "Range bounds are reversed in '" + lo + " to " + hi + " cycles later'. Write the smaller bound first." };
+    return { op: "##[" + lo + ":" + hi + "]", words: m[1] + " to " + m[2] + " cycles later" };
+  }
+  m = lower.match(/(\d+)\s+to\s+(\d+)\s+cycles?/);
+  if (m) {
+    const lo = +m[1], hi = +m[2];
+    if (lo > hi) return { invalid: "Range bounds are reversed in '" + lo + " to " + hi + " cycles'. Write the smaller bound first." };
+    return { op: "##[" + lo + ":" + hi + "]", words: m[1] + " to " + m[2] + " cycles" };
+  }
+  m = lower.match(/within\s+(\d+)\s+cycles?/);
+  if (m) return { op: "##[1:" + m[1] + "]", words: "within " + m[1] + " cycles",
+    note: "Interpretation: 'within " + m[1] + " cycles' counts cycles 1 to " + m[1] + " after the trigger; the trigger cycle itself is not counted. Write 'within 0 to " + m[1] + " cycles' to include the trigger cycle." };
   m = lower.match(/no\s+later\s+than\s+(\d+)\s+cycles?/);
-  if (m) return { op: "##[1:" + m[1] + "]", words: "within " + m[1] + " cycles" };
+  if (m) return { op: "##[1:" + m[1] + "]", words: "within " + m[1] + " cycles",
+    note: "Interpretation: 'no later than " + m[1] + " cycles' counts cycles 1 to " + m[1] + " after the trigger; the trigger cycle itself is not counted." };
   m = lower.match(/after\s+(\d+)\s+cycles?/);
   if (m) return { op: "##" + m[1], words: m[1] + " cycles later" };
   m = lower.match(/(\d+)\s+cycles?\s+later/);
@@ -728,20 +806,16 @@ function verbForClause(clause, ctx) {
   return { kw: "assert", pre: "a_" };
 }
 
-function wrapSync(ctx, core) {
-  return ctx.sync ? "(" + ctx.notRst + ") |-> (" + core + ")" : core;
-}
-
 function propLines(ctx, pname, core, vname, vkw) {
   const D = ctx.dis ? " " + ctx.dis : "";
-  return "property " + pname + ";\n  @(" + ctx.event + ")" + D + "\n    " + wrapSync(ctx, core) + ";\nendproperty\n" +
+  return "property " + pname + ";\n  @(" + ctx.event + ")" + D + "\n    " + core + ";\nendproperty\n" +
     vname + " : " + vkw + " property (" + pname + ");";
 }
 
 function oneLiner(ctx, vname, vkw, core, comment) {
   const D = ctx.dis ? " " + ctx.dis : "";
   return (comment ? "// " + comment + "\n" : "") +
-    vname + " : " + vkw + " property (@(" + ctx.event + ")" + D + " " + wrapSync(ctx, core) + ");";
+    vname + " : " + vkw + " property (@(" + ctx.event + ")" + D + " " + core + ");";
 }
 
 function parseResetValues(sentence, known) {
@@ -750,8 +824,8 @@ function parseResetValues(sentence, known) {
     const sig = findSignalIn(p, known);
     if (!sig) return;
     const t = " " + p.toLowerCase() + " ";
-    const m = t.match(/=\s*(0x[0-9a-f]+|\d+)/) || t.match(/\bis\s+(0x[0-9a-f]+|\d+)\b/);
-    if (m) { vals.push({ sig: sig, expr: "(" + sig + " == " + m[1] + ")" }); return; }
+    const lit = findLiteral(p);
+    if (lit) { checkLiteralWidth(lit); vals.push({ sig: sig, expr: "(" + sig + " == " + lit + ")" }); return; }
     if (/\b(high|asserted)\b/.test(t) && !/\b(low|deasserted)\b/.test(t)) { vals.push({ sig: sig, expr: sig }); return; }
     vals.push({ sig: sig, expr: "(!" + sig + ")" });
   });
@@ -772,35 +846,99 @@ function buildHold(req, X, ctx, clause) {
     "Same check in named form. No cover point is needed for a condition that must always hold.");
 }
 
+/* Duration words in the consequent: "for 3 cycles", "for at least 3 cycles",
+   "for exactly 3 cycles". They are converted to repetition operators, never dropped. */
+function extractDuration(clause) {
+  let m = clause.match(/\bfor\s+at\s+least\s+(\d+)\s+cycles?\b/i);
+  if (m) return { n: +m[1], kind: "atLeast" };
+  m = clause.match(/\bfor\s+exactly\s+(\d+)\s+cycles?\b/i);
+  if (m) return { n: +m[1], kind: "exactly" };
+  m = clause.match(/\bfor\s+(\d+)\s+cycles?\b/i);
+  if (m) return { n: +m[1], kind: "for" };
+  return null;
+}
+function applyDuration(C, dur) {
+  if (!dur) return C;
+  if (dur.kind === "atLeast") return "(" + C + ")[*" + dur.n + ":$]";
+  if (dur.kind === "exactly") return "(" + C + ")[*" + dur.n + "] ##1 (!(" + C + "))";
+  return "(" + C + ")[*" + dur.n + "]";
+}
+
+/* $past history-valid helpers: $past(x, N>=2) needs N valid post-reset samples.
+   A warning alone does not guard the check, so the tool generates real helper
+   logic and gates the property on it. */
+let pastHelpers = {};
+function pastNeeded(expr) {
+  const m = expr.match(/\$past\(\w+,\s*([2-9]\d*)\)/);
+  return m ? +m[1] : 0;
+}
+function registerPastHelper(n, ctx) {
+  if (pastHelpers[n]) return;
+  const w = Math.max(1, Math.ceil(Math.log2(n + 1)));
+  const cnt = "hist_cnt_" + n, vld = "hist_valid_" + n;
+  const rstA = ctx.activeLow ? "(!" + ctx.rst + ")" : ctx.rst;
+  const head = ctx.sync
+    ? "always @(" + ctx.edge + " " + ctx.clk + ") begin"
+    : "always @(" + ctx.edge + " " + ctx.clk + " or " + (ctx.activeLow ? "negedge " : "posedge ") + ctx.rst + ") begin";
+  pastHelpers[n] =
+    "// History-valid helper for $past(..., " + n + "): the check needs " + n + " valid post-reset samples.\n" +
+    "// Include once per module. Pre-reset history is treated as invalid. Assumes reset is asserted at time zero.\n" +
+    "logic [" + (w - 1) + ":0] " + cnt + ";\n" +
+    head + "\n" +
+    "  if (" + rstA + ") " + cnt + " <= '0;\n" +
+    "  else if (" + cnt + " != " + n + ") " + cnt + " <= " + cnt + " + 1'b1;\n" +
+    "end\n" +
+    "wire " + vld + " = (" + cnt + " == " + n + ");";
+}
+
 function buildImplication(req, A, C, timing, ctx, conClause) {
   const V = verbForClause(conClause || "", ctx);
+  // Duration words belong to the consequent; they are never dropped silently.
+  const dur = extractDuration(conClause || "");
+  const Cd = applyDuration(C, dur);
+  let durNote = "";
+  if (dur) {
+    if (dur.kind === "atLeast") durNote = " \"For at least " + dur.n + " cycles\" means " + dur.n + " or more consecutive cycles ([*" + dur.n + ":$]).";
+    else if (dur.kind === "exactly") durNote = " \"For exactly " + dur.n + " cycles\" means " + dur.n + " consecutive cycles followed by a cycle where the condition drops (termination check ##1 !(...)).";
+    else durNote = " \"For " + dur.n + " cycles\" means " + dur.n + " consecutive cycles ([*" + dur.n + "]).";
+    if (!timing) durNote += " The spec did not pin the start cycle, so the check starts in the same cycle as the trigger.";
+  }
+  const tNote = timing && timing.note ? " " + timing.note : "";
+  // $past history: gate on a generated history-valid helper, not a warning alone.
+  const pastN = pastNeeded(A + " " + Cd);
+  let Ag = A, histNote = "";
+  if (pastN) {
+    registerPastHelper(pastN, ctx);
+    Ag = "(hist_valid_" + pastN + " && (" + A + "))";
+    histNote = " $past(..., " + pastN + ") needs " + pastN + " valid post-reset samples: the check is gated by hist_valid_" + pastN + " (see Helper logic below), so pre-reset history is treated as invalid. If your environment guarantees meaningful pre-reset history, remove the gate.";
+  }
   let core;
-  if (timing && timing.op === "|=>") core = A + " |=> " + C;
-  else if (timing && timing.op === "|->") core = A + " |-> " + C;
-  else if (timing && timing.op === "s_eventually") core = A + " |-> s_eventually " + C;
-  else if (timing) core = A + " |-> " + timing.op + " " + C;
-  else core = A + " |-> " + C;
+  if (timing && timing.op === "|=>") core = Ag + " |=> " + Cd;
+  else if (timing && timing.op === "|->") core = Ag + " |-> " + Cd;
+  else if (timing && timing.op === "s_eventually") core = Ag + " |-> s_eventually " + Cd;
+  else if (timing) core = Ag + " |-> " + timing.op + " " + Cd;
+  else core = Ag + " |-> " + Cd;
   const when = timing ? timing.words : "the same cycle";
   const retrig = /(\$rose|\$fell)/.test(A) ? "" : " A new check starts on every cycle the left side holds; overlapping checks are independent.";
-  const pastM = (A + " " + C).match(/\$past\(\w+,\s*([2-9]\d*)\)/);
-  const pastNote = pastM ? " Note: $past with " + pastM[1] + " cycles needs that much history after reset. In the first " + pastM[1] + " cycles after reset it samples X and can fail spuriously; this property assumes the scenario only matters once that history exists." : "";
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
-    "The simplest form. Whenever the left side holds, the right side must hold " + when + "." + retrig + pastNote);
+    "The simplest form. Whenever the left side holds, the right side must hold " + when + "." + retrig + durNote + tNote + histNote);
   addLevel(req, "Intermediate", "i",
     propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
-    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench." + pastNote);
+    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench." + durNote + tNote + histNote);
+  // Advanced: exactly one implication operator. The cause sequence carries the
+  // trigger; a delay operator (if any) follows the single |-> / |=>.
   let advCore, coverCore;
-  if (timing && timing.op !== "|=>" && timing.op !== "s_eventually") {
-    advCore = "s_req" + req.n + "_cause |-> " + timing.op + " " + C;
-    coverCore = A + " " + timing.op + " " + C;
+  if (timing && timing.op !== "|=>" && timing.op !== "s_eventually" && timing.op !== "|->") {
+    advCore = "s_req" + req.n + "_cause |-> " + timing.op + " " + Cd;
+    coverCore = Ag + " " + timing.op + " " + Cd;
   } else if (timing && timing.op === "s_eventually") {
-    advCore = A + " |-> s_eventually " + C;
-    coverCore = A + " ##1 " + C;
+    advCore = Ag + " |-> s_eventually " + Cd;
+    coverCore = Ag + " ##1 " + Cd;
   } else {
     const acop = timing && timing.op === "|=>" ? "|=>" : "|->";
-    advCore = "s_req" + req.n + "_cause " + acop + " " + C;
-    coverCore = A + " ##1 " + C;
+    advCore = "s_req" + req.n + "_cause " + acop + " " + Cd;
+    coverCore = Ag + (acop === "|=>" ? " ##1 " : " |-> ") + Cd;
   }
   const D = ctx.dis ? " " + ctx.dis : "";
   const seqPart = (timing && timing.op === "s_eventually")
@@ -809,7 +947,8 @@ function buildImplication(req, A, C, timing, ctx, conClause) {
   addLevel(req, "Advanced", "a",
     seqPart + propLines(ctx, "p_req" + req.n + "_adv", advCore, V.pre + "req" + req.n + "_adv", V.kw) +
     "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " " + coverCore + ");",
-    "Sequence based form plus a cover point, so you also prove the scenario is reachable and not vacuous." + pastNote);
+    "Sequence based form plus a cover point, so you also prove the scenario is reachable and not vacuous." + durNote + tNote + histNote);
+  drainLitWarnings(req);
 }
 
 function buildInvariant(req, X, ctx, clause) {
@@ -872,18 +1011,24 @@ function buildReset(req, vals, ctx) {
   const trig = ctx.sync
     ? rstAsserted + " ##1 " + rstDeasserted
     : (ctx.activeLow ? "$fell(" + ctx.rst + ")" : "$rose(" + ctx.rst + ")");
+  // The reset-value check samples the reset edge itself for async reset, and
+  // carries no "disable iff": disabling on reset would kill the very attempt
+  // that observes the reset transition.
+  const ev = ctx.sync ? ctx.event
+    : ctx.event + " or " + (ctx.activeLow ? "negedge " : "posedge ") + ctx.rst;
   addLevel(req, "Beginner", "b",
-    "// " + req.sentence + "\n" + V.pre + "req" + req.n + " : " + V.kw + " property (@(" + ctx.event + ") " + trig + " |-> ##1 (" + checks + "));",
-    "The simplest form. One cycle after reset " + (ctx.sync ? "deasserts (sampled)" : "falls") + ", the listed signals must hold their reset values.");
+    "// " + req.sentence + "\n" + V.pre + "req" + req.n + " : " + V.kw + " property (@(" + ev + ") " + trig + " |-> ##1 (" + checks + "));",
+    "The simplest form. One clock after the reset transition is observed, the listed signals must hold their reset values.");
   addLevel(req, "Intermediate", "i",
-    "property p_req" + req.n + ";\n  @(" + ctx.event + ")\n    " + trig + " |-> ##1 (" + checks + ");\nendproperty\n" +
+    "property p_req" + req.n + ";\n  @(" + ev + ")\n    " + trig + " |-> ##1 (" + checks + ");\nendproperty\n" +
     V.pre + "req" + req.n + " : " + V.kw + " property (p_req" + req.n + ");",
     "Named property spelling out each reset value from your spec.");
   const xchecks = vals.map(function(v){ return v.expr + " && !$isunknown(" + v.sig + ")"; }).join(" && ");
   addLevel(req, "Advanced", "a",
-    "property p_req" + req.n + "_adv;\n  @(" + ctx.event + ")\n    " + trig + " |-> ##1 (" + xchecks + ");\nendproperty\n" +
+    "property p_req" + req.n + "_adv;\n  @(" + ev + ")\n    " + trig + " |-> ##1 (" + xchecks + ");\nendproperty\n" +
     V.pre + "req" + req.n + "_adv : " + V.kw + " property (p_req" + req.n + "_adv);",
     "Also checks for X, so an uninitialized register cannot hide behind a reset value comparison.");
+  drainLitWarnings(req);
 }
 
 function buildLiveness(req, E, ctx, clause) {
@@ -1263,13 +1408,23 @@ function dataSigs(known) {
   });
 }
 
+/* A check whose consequent already follows from its trigger can never fail and
+   adds no independent verification value, e.g. (wr_en && !full) |-> !full. */
+function isTautology(A, C) {
+  const norm = function(x){ return x.replace(/\s+/g, "").replace(/^\(+/, "").replace(/\)+$/, ""); };
+  const cn = norm(C);
+  return norm(A).split("&&").some(function(p){ return norm(p) === cn; });
+}
+
 function buildRequirements(body, ctx) {
   const known = ctx.signals.map(function(s){ return s.name; });
   const sentences = splitSentences(body);
   const reqs = [];
   const skipped = [];
+  pastHelpers = {};
   sentences.forEach(function(s, idx){
     const n = idx + 1;
+    litWarnings.length = 0;
     // "A unless B" reads as "A until B"
     if (/\bunless\b/i.test(s) && !/^\s*(if|when|whenever|once)\b/i.test(s)) {
       s = s.replace(/\bunless\b/gi, "until");
@@ -1283,6 +1438,14 @@ function buildRequirements(body, ctx) {
     if (/\bclock\s+domain\b|\bcdc\b|metastab/i.test(t)) {
       skipped.push({ n: n, sentence: s,
         reason: "This requirement spans clock domains. Clock-domain crossing needs dedicated CDC methodology (synchronizer chains, handshake protocols), which this tool does not generate. It was skipped rather than guessed." });
+      return;
+    }
+    // "X updates": checking that a signal carries the right updated value needs
+    // a reference model or scoreboard. $changed would invent "value must change"
+    // semantics: a valid read may return the same value as the previous read.
+    if (/\bupdates?\b|\bupdated\b/i.test(t)) {
+      skipped.push({ n: n, sentence: s,
+        reason: "Checking that a signal carries the correct updated value needs a reference model or scoreboard. A $changed check would pass or fail on data coincidence, not correctness, so nothing was generated." });
       return;
     }
 
@@ -1336,7 +1499,17 @@ function buildRequirements(body, ctx) {
     if (m) {
       const A = clauseToExpr(m[2], known), C = clauseToExpr(m[3], known);
       const timing = extractTiming(t);
+      if (timing && timing.invalid) {
+        skipped.push({ n: n, sentence: s, reason: timing.invalid + " It was skipped rather than guessed." });
+        return;
+      }
       if (A && C) {
+        // Tautology: the consequent already follows from the trigger.
+        if (isTautology(A, C)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "The consequent (" + C + ") already follows from the trigger (" + A + "), so this check can never fail and adds no independent verification value. It was skipped." });
+          return;
+        }
         // "becomes <VALUE>" with an unmapped value name: do not drop the value silently
         if (/\bbecomes\s+(?!high\b|low\b|active\b|inactive\b)(\w+)/i.test(m[3]) && /^\(?\w+\)?$/.test(C)) {
           skipped.push({ n: n, sentence: s,
@@ -1374,7 +1547,16 @@ function buildRequirements(body, ctx) {
       const subj = (m[1] + " " + m[2]).replace(/\bonly\b/gi, "").trim();
       const X = clauseToExpr(subj, known), Y = clauseToExpr(m[4], known);
       const timing = extractTiming(t);
+      if (timing && timing.invalid) {
+        skipped.push({ n: n, sentence: s, reason: timing.invalid + " It was skipped rather than guessed." });
+        return;
+      }
       if (X && Y) {
+        if (isTautology(X, Y)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "The consequent (" + Y + ") already follows from the trigger (" + X + "), so this check can never fail and adds no independent verification value. It was skipped." });
+          return;
+        }
         const req = mkReq(n, s, "implication",
           subj + " holds only when " + m[4].trim() + ", so it implies " + m[4].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
         buildImplication(req, X, Y, timing, ctx, subj);
@@ -1420,7 +1602,16 @@ function buildRequirements(body, ctx) {
     if (m) {
       const A = clauseToExpr(m[2], known), C = clauseToExpr(m[1], known);
       const timing = extractTiming(t);
+      if (timing && timing.invalid) {
+        skipped.push({ n: n, sentence: s, reason: timing.invalid + " It was skipped rather than guessed." });
+        return;
+      }
       if (A && C) {
+        if (isTautology(A, C)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "The consequent (" + C + ") already follows from the trigger (" + A + "), so this check can never fail and adds no independent verification value. It was skipped." });
+          return;
+        }
         if (!timing && /\bwithin\b/i.test(t)) {
           skipped.push({ n: n, sentence: s,
             reason: "The delay bound is parameterized or unreadable ('within N cycles' needs a concrete number). It was skipped rather than guessed." });
@@ -1438,7 +1629,16 @@ function buildRequirements(body, ctx) {
     if (m) {
       const A = clauseToExpr(m[3], known), C = clauseToExpr(m[1], known);
       const timing = extractTiming(t);
+      if (timing && timing.invalid) {
+        skipped.push({ n: n, sentence: s, reason: timing.invalid + " It was skipped rather than guessed." });
+        return;
+      }
       if (A && C) {
+        if (isTautology(A, C)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "The consequent (" + C + ") already follows from the trigger (" + A + "), so this check can never fail and adds no independent verification value. It was skipped." });
+          return;
+        }
         const req = mkReq(n, s, "implication",
           "If " + m[3].trim() + ", then " + m[1].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
         buildImplication(req, A, C, timing, ctx, m[1]);
@@ -1468,6 +1668,10 @@ function buildRequirements(body, ctx) {
     // Anything with unhandled temporal or sequencing words is skipped, never guessed.
     const E = clauseToExpr(s, known);
     const timingG = extractTiming(t);
+    if (timingG && timingG.invalid) {
+      skipped.push({ n: n, sentence: s, reason: timingG.invalid + " It was skipped rather than guessed." });
+      return;
+    }
     if (E && timingG && timingG.op === "s_eventually") {
       const req = mkReq(n, s, "liveness", E + " must eventually become true.");
       buildLiveness(req, E, ctx, s);
@@ -1500,15 +1704,18 @@ let currentCtx = null;
 const $ = function(id){ return document.getElementById(id); };
 
 function makeCtx(gate) {
-  const rstEdge = gate.activeLow ? "negedge" : "posedge";
-  const event = gate.edge + " " + gate.clkName + (gate.sync ? "" : " or " + rstEdge + " " + gate.rstName);
+  // The sampling event is the clock edge only. The reset edge is never added
+  // to the event list: for async reset, "disable iff" already kills attempts
+  // the moment reset asserts; for sync reset it kills them when sampled.
+  // Reset semantics (both kinds): reset cancels in-flight obligations.
+  const event = gate.edge + " " + gate.clkName;
   const rstExpr = gate.activeLow ? "(!" + gate.rstName + ")" : gate.rstName;
   const notRst = gate.activeLow ? gate.rstName : "(!" + gate.rstName + ")";
   return {
     clk: gate.clkName, edge: gate.edge, rst: gate.rstName,
     activeLow: gate.activeLow, sync: gate.sync,
     event: event,
-    dis: gate.sync ? "" : "disable iff " + rstExpr,
+    dis: "disable iff " + rstExpr,
     notRst: notRst,
     signals: gate.signals, depth: gate.hdr.depth
   };
@@ -1624,7 +1831,7 @@ function render() {
   }
   const sets = [
     { tag: "Beginner", cls: "b", note: "The simplest checks for the whole spec, one per requirement." },
-    { tag: "Intermediate", cls: "i", note: "The recommended set. Named properties with reset handled, ready for your testbench." },
+    { tag: "Intermediate", cls: "i", note: "The recommended set. Named properties with reset handled. Compile-checked with slang; behavior spot-checked on a reference model, not proven on a simulator." },
     { tag: "Advanced", cls: "a", note: "Sequence based forms with timing windows and cover points, for thorough checking." }
   ];
   sets.forEach(function(set){
@@ -1659,6 +1866,37 @@ function render() {
     div.appendChild(pre);
     cards.appendChild(div);
   });
+  const helperKeys = Object.keys(pastHelpers);
+  if (helperKeys.length) {
+    const div = document.createElement("div");
+    div.className = "acard";
+    const head = document.createElement("div");
+    head.className = "ahead";
+    const strong = document.createElement("strong");
+    strong.textContent = "Helper logic: include once per module";
+    const copy = document.createElement("button");
+    copy.className = "btn small";
+    copy.textContent = "Copy";
+    const hcode = helperKeys.map(function(k){ return pastHelpers[k]; }).join("\n\n");
+    copy.onclick = function(){
+      const done = function(){ copy.textContent = "Copied"; setTimeout(function(){ copy.textContent = "Copy"; }, 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(hcode).then(done, done);
+      else done();
+    };
+    head.appendChild(strong);
+    head.appendChild(copy);
+    div.appendChild(head);
+    const note = document.createElement("div");
+    note.className = "understand";
+    note.textContent = "Your spec uses $past with multi-cycle history. A warning alone does not guard the check, so this helper counts valid post-reset samples and the properties above are gated on it. Pre-reset history is treated as invalid.";
+    div.appendChild(note);
+    const pre = document.createElement("pre");
+    const codeEl = document.createElement("code");
+    codeEl.textContent = hcode;
+    pre.appendChild(codeEl);
+    div.appendChild(pre);
+    cards.appendChild(div);
+  }
   if (currentSkipped.length) {
     const div = document.createElement("div");
     div.className = "acard";
@@ -1700,9 +1938,11 @@ function recommendedSv() {
   const header =
     "// Generated by spec2sva from your spec text\n" +
     "// Recommended set: the Intermediate assertions.\n" +
-    "// Review every assertion before binding to your DUT.\n\n" +
+    "// Compile-checked with slang; not simulator-proven. Review every assertion before binding to your DUT.\n\n" +
     "module spec2sva_checks (\n" + ports.join("\n") + "\n);\n\n";
-  return header + levelCode("Intermediate") + "\n\nendmodule\n";
+  const helperKeys = Object.keys(pastHelpers);
+  const helpers = helperKeys.length ? helperKeys.map(function(k){ return pastHelpers[k]; }).join("\n\n") + "\n\n" : "";
+  return header + helpers + levelCode("Intermediate") + "\n\nendmodule\n";
 }
 
 function doGenerate(force, specOverride) {
@@ -1716,7 +1956,13 @@ function doGenerate(force, specOverride) {
   const out = buildRequirements(gate.body, currentCtx);
   current = out.reqs;
   currentSkipped = out.skipped;
-  currentNotes = gate.notes;
+  currentNotes = gate.notes.slice();
+  // Reset semantics, stated once and implemented consistently: reset cancels
+  // in-flight obligations via "disable iff". The reset edge is not added to
+  // the property sampling event.
+  currentNotes.push(currentCtx.sync
+    ? "Synchronous reset: @(posedge " + currentCtx.clk + ") disable iff (" + (currentCtx.activeLow ? "!" + currentCtx.rst : currentCtx.rst) + "). Reset is sampled on the clock and cancels in-flight obligations; it does not merely block new ones."
+    : "Asynchronous reset: @(posedge " + currentCtx.clk + ") disable iff (" + (currentCtx.activeLow ? "!" + currentCtx.rst : currentCtx.rst) + "). Attempts are killed the moment reset asserts; the reset edge is not in the sampling event.");
   render();
   try { pgRefreshSrc(); } catch (e) {}
   try { bdFillSelects(); bdPreview(); } catch (e) {}
@@ -1935,12 +2181,13 @@ $("shareLink").onclick = function(){
    Cycle-based model of the spec2sva-supported SVA subset. This is NOT a
    SystemVerilog simulator; it is a straightforward reference model used by the
    waveform playground to illustrate pass/fail/vacuous behavior.
-   Supported: |-> |=> ##N ##[a:b] [*N] s_eventually until(weak)
+   Supported: |-> |=> ##N ##[a:b] [*N] [*N:$] s_eventually until(weak)
    $rose $fell $stable $past $onehot0 $isunknown ! && || == != + -
+   Sized/unsigned SV literals (8'hA5, 'hA5) as numbers.
    Trace: {sig: [0|1|null,...]}, null = X. Returns per-cycle attempts. */
 
 function svaTokenize(s) {
-  const re = /\s*(\|->|\|=>|##|&&|\|\||==|!=|[A-Za-z_$][\w$]*|\d+|[()\[\]{},:!*+\-])/g;
+  const re = /\s*(\|->|\|=>|##|&&|\|\||==|!=|\d+'[sS]?[hH][0-9a-fA-F]+|\d+'[sS]?[dD]\d+|\d+'[sS]?[bB][01]+|\d+'[sS]?[oO][0-7]+|'[hH][0-9a-fA-F]+|'[dD]\d+|'[bB][01]+|'[oO][0-7]+|[A-Za-z_$][\w$]*|\d+|[()\[\]{},:!*+\-])/g;
   const toks = [];
   let m, last = 0;
   const stripped = s;
@@ -2003,8 +2250,9 @@ function svaParse(s) {
     if (peek() === "[") {
       next();
       if (peek() === "*") {
-        next(); const n = parseInt(next(), 10); expect("]");
-        return { k: "rep", base: base, n: n };
+        next(); const n = parseInt(next(), 10);
+        if (peek() === ":") { next(); expect("$"); expect("]"); return { k: "repGoto", base: base, n: n }; }
+        expect("]"); return { k: "rep", base: base, n: n };
       }
       i--;
     }
@@ -2061,6 +2309,8 @@ function svaParse(s) {
     const p = peek();
     if (/^\$/.test(p)) return sysfunc();
     const q = next();
+    const lv = svLitVal(q);
+    if (lv !== null) return { k: "lit", v: lv };
     if (/^\d+$/.test(q)) return { k: "lit", v: parseInt(q, 10) };
     if (/^[A-Za-z_]/.test(q)) return { k: "sig", sig: q };
     if (q === "(") { const e = bexpr(); expect(")"); return e; }
@@ -2069,6 +2319,15 @@ function svaParse(s) {
   const e = prop();
   if (i < t.length) throw new Error("trailing tokens: " + t.slice(i).join(" "));
   return e;
+}
+
+/* Numeric value of a SystemVerilog literal token for the reference model. */
+function svLitVal(tok) {
+  let m = tok.match(/^[0-9]*'[sS]?[hH]([0-9a-fA-F]+)$/); if (m) return parseInt(m[1], 16);
+  m = tok.match(/^[0-9]*'[sS]?[dD]([0-9]+)$/i); if (m) return parseInt(m[1], 10);
+  m = tok.match(/^[0-9]*'[sS]?[bB]([01]+)$/i); if (m) return parseInt(m[1], 2);
+  m = tok.match(/^[0-9]*'[sS]?[oO]([0-7]+)$/i); if (m) return parseInt(m[1], 8);
+  return null;
 }
 
 function svaSig(trace, sig, tt) {
@@ -2110,21 +2369,30 @@ function svaRst(rst, tt) {
   return rst[tt] === 0;
 }
 
-/* match a sequence; items[0] is term|null(rep)|null(leading delay) */
+/* match a sequence; items[0] is term|null(rep)|null(leading delay).
+   Reset kills an in-flight attempt (disable iff semantics): returns killed. */
 function svaSeqMatch(items, trace, t, rst, ncyc) {
   function repOk(term, tt) {
-    if (term.k !== "rep") return svaBval(term, trace, tt) === 1 && !svaRst(rst, tt);
-    for (let k = 0; k < term.n; k++) {
-      if (svaBval(term.base, trace, tt + k) !== 1 || svaRst(rst, tt + k)) return false;
+    if (term.k === "rep" || term.k === "repGoto") {
+      for (let k = 0; k < term.n; k++) {
+        if (svaRst(rst, tt + k)) return -1;
+        if (svaBval(term.base, trace, tt + k) !== 1) return 0;
+      }
+      return 1;
     }
-    return true;
+    if (svaRst(rst, tt)) return -1;
+    return svaBval(term, trace, tt) === 1 && !svaRst(rst, tt) ? 1 : 0;
   }
-  function repEnd(term, tt) { return term.k === "rep" ? tt + term.n - 1 : tt; }
+  function repEnd(term, tt) { return (term.k === "rep" || term.k === "repGoto") ? tt + term.n - 1 : tt; }
   const first = items[0];
   let cur, idx;
   if (first === null) { cur = t; idx = 1; }
-  else if (!repOk(first, t)) return { ok: false, end: t };
-  else { cur = repEnd(first, t); idx = 1; }
+  else {
+    const fr = repOk(first, t);
+    if (fr < 0) return { ok: true, end: t, killed: true };
+    if (!fr) return { ok: false, end: t };
+    cur = repEnd(first, t); idx = 1;
+  }
   for (let j = idx; j < items.length; j++) {
     const d = items[j][0], term = items[j][1];
     let found = -1;
@@ -2133,8 +2401,10 @@ function svaSeqMatch(items, trace, t, rst, ncyc) {
       if (tt >= ncyc) break;
       let killed = false;
       for (let x = cur + 1; x <= tt; x++) if (svaRst(rst, x)) { killed = true; break; }
-      if (killed) continue;
-      if (repOk(term, tt)) { found = tt; break; }
+      if (killed) return { ok: true, end: tt, killed: true };
+      const mr = repOk(term, tt);
+      if (mr < 0) return { ok: true, end: tt, killed: true };
+      if (mr) { found = tt; break; }
     }
     if (found < 0) return { ok: false, end: cur };
     cur = repEnd(term, found);
@@ -2182,7 +2452,7 @@ function svaCheck(core, trace, ncyc, rstName) {
       } else {
         const items = ast.b.k === "seq" ? ast.b.items : [ast.b];
         r = svaSeqMatch(items, trace, t0, rst, ncyc);
-        note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "completed" : "no match");
+        note(t, r.killed ? "vacuous-killed" : (r.ok ? "pass" : "fail"), r.end, r.killed ? "killed by reset" : (r.ok ? "completed" : "no match"));
         if (!r.ok) return { verdict: "FAIL", attempts: attempts };
       }
     }
@@ -2195,7 +2465,7 @@ function svaCheck(core, trace, ncyc, rstName) {
       if (svaRst(rst, t)) continue;
       const items = ast.k === "seq" ? ast.items : [ast];
       const r = svaSeqMatch(items, trace, t, rst, ncyc);
-      note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "holds" : "violated");
+      note(t, r.killed ? "vacuous-killed" : (r.ok ? "pass" : "fail"), r.end, r.killed ? "killed by reset" : (r.ok ? "holds" : "violated"));
       if (!r.ok) return { verdict: "FAIL", attempts: attempts };
     }
   }
@@ -2213,7 +2483,7 @@ const PG_EXAMPLES = [
     trace: { irq: [0,0,1,1,1,1,0,0,0,0,0,0] },
     blurb: "every irq pulse is at least 4 cycles wide" },
   { name: "Stability", core: "(req) |-> $stable(gnt)", sigs: ["req", "gnt"],
-    trace: { req: [0,1,1,1,0,0,0,0,0,0,0,0], gnt: [0,1,1,1,1,0,0,0,0,0,0,0] },
+    trace: { req: [0,1,1,1,0,0,0,0,0,0,0,0], gnt: [1,1,1,1,1,0,0,0,0,0,0,0] },
     blurb: "gnt holds steady while req is high" },
   { name: "Mutex", core: "$onehot0({gnt0, gnt1})", sigs: ["gnt0", "gnt1"],
     trace: { gnt0: [0,0,1,1,0,0,0,0,0,0,0,0], gnt1: [0,0,0,0,1,1,0,0,0,0,0,0] },
@@ -2520,7 +2790,8 @@ function bdPreview() {
       const m = eng.match(/^\s*when\s+(.+?),\s*(.+?)\s*\.\s*$/i);
       if (m) {
         const A = clauseToExpr(m[1], known), C = clauseToExpr(m[2], known);
-        const timing = extractTiming(" " + eng.toLowerCase() + " ");
+        let timing = extractTiming(" " + eng.toLowerCase() + " ");
+        if (timing && timing.invalid) timing = null;
         if (A && C) {
           const req = { n: 0, sentence: eng, levels: [] };
           buildImplication(req, A, C, timing, currentCtx, m[2]);
