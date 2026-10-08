@@ -176,6 +176,24 @@
   details.ai { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
   details.ai summary { cursor: pointer; font-size: 13px; font-weight: 600; }
   footer { text-align: center; color: var(--muted); font-size: 12px; padding: 20px; }
+    table.pg { border-collapse: collapse; margin: 4px 0; }
+    table.pg th, table.pg td { border: 1px solid #e2ddd2; padding: 0; text-align: center; min-width: 34px; height: 30px; font-size: 13px; }
+    table.pg th { background: #f4f1ea; color: #6b6455; font-weight: 600; cursor: pointer; padding: 4px 2px; }
+    table.pg th.cur { background: #f5b301; color: #1a1a1a; }
+    table.pg td.sig { background: #f4f1ea; font-weight: 600; padding: 0 10px; cursor: default; text-align: left; }
+    table.pg td.cell { cursor: pointer; font-family: ui-monospace, monospace; }
+    table.pg td.cell.v1 { background: #dcefe0; }
+    table.pg td.cell.vx { background: #fdf0d5; color: #9a6b00; }
+    table.pg td.curcol { box-shadow: inset 0 0 0 2px #f5b301; }
+    .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-weight: 700; font-size: 13px; }
+    .badge.pass { background: #dcefe0; color: #1d6b2f; }
+    .badge.fail { background: #fbe3e3; color: #a02020; }
+    .badge.vac { background: #fdf0d5; color: #9a6b00; }
+    .badge.err { background: #eee; color: #666; }
+    .pg-ex { display: inline-block; border: 1px solid #e2ddd2; border-radius: 8px; padding: 8px 10px; margin: 0 8px 8px 0; cursor: pointer; font-size: 13px; background: #fff; }
+    .pg-ex:hover { border-color: #f5b301; }
+    .pg-ex b { display: block; font-size: 13px; }
+    .pg-ex span { color: #6b6455; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -196,9 +214,59 @@
     <div class="tabs">
       <button class="tab active" data-tab="spec">Spec text</button>
       <button class="tab" data-tab="wave">Waveform</button>
+      <button class="tab" data-tab="play">Playground</button>
       <button class="tab" data-tab="explain">Explain SVA</button>
     </div>
     <div id="pane-spec">
+    <details id="builderBox" style="margin-bottom:10px">
+      <summary style="cursor:pointer;font-weight:600">Guided builder: compose a requirement</summary>
+      <div class="row" style="margin-top:8px">
+        <div>
+          <label for="bdA">Signal A</label>
+          <select id="bdA"></select>
+        </div>
+        <div>
+          <label for="bdATrig">does</label>
+          <select id="bdATrig">
+            <option value="rises">rises</option>
+            <option value="falls">falls</option>
+            <option value="high">is high</option>
+            <option value="low">is low</option>
+          </select>
+        </div>
+        <div>
+          <label for="bdB">Signal B</label>
+          <select id="bdB"></select>
+        </div>
+        <div>
+          <label for="bdBPred">does</label>
+          <select id="bdBPred">
+            <option value="rises">rises</option>
+            <option value="falls">falls</option>
+            <option value="high">is high</option>
+            <option value="low">is low</option>
+            <option value="stable">is stable</option>
+          </select>
+        </div>
+        <div>
+          <label for="bdT">timing</label>
+          <select id="bdT">
+            <option value="same">in the same cycle</option>
+            <option value="next">in the next cycle</option>
+            <option value="within">within N cycles</option>
+            <option value="after">N cycles later</option>
+            <option value="eventually">eventually</option>
+          </select>
+        </div>
+        <div>
+          <label for="bdN">N</label>
+          <input type="number" id="bdN" value="3" min="1" max="32" style="width:64px">
+        </div>
+      </div>
+      <div class="sv" id="bdEnglish" style="margin:8px 0"></div>
+      <div class="sv" id="bdSva" style="margin-bottom:8px"></div>
+      <button class="btn small" id="bdAdd">Add to spec</button>
+    </details>
     <label for="spec">Spec text</label>
     <textarea id="spec" placeholder="Type or paste your spec here. One requirement per line or sentence works best. Example: When wr_en is high and full is low, the write pointer increments in the next cycle."></textarea>
     </div>
@@ -207,6 +275,44 @@
     <textarea id="wave" placeholder='{"signal": [{"name": "clk", "wave": "p........."}, {"name": "req", "wave": "0.1....0.."}, {"name": "ack", "wave": "0...11..0."}]}'></textarea>
     <p class="hint">Paste WaveDrom JSON. The app reads the edges, writes down the requirements it sees, and generates assertions from them.</p>
     <div id="waveReqs" class="understand" style="display:none"></div>
+    </div>
+    <div id="pane-play" style="display:none">
+    <p class="hint">Pick a requirement or an example, then click cells to drive the signals. This is a reference model for illustration, not a SystemVerilog simulator.</p>
+    <div class="row" style="margin-bottom:8px">
+      <div style="flex:2">
+        <label for="pgSrc">Requirement or example</label>
+        <select id="pgSrc"></select>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button class="btn small" id="pgResetTrace">Reset trace</button>
+      </div>
+    </div>
+    <div id="pgCore" class="sv" style="margin-bottom:8px"></div>
+    <div style="overflow-x:auto">
+    <table id="pgGrid" class="pg"></table>
+    </div>
+    <p class="hint">Click a cell to cycle 0 &rarr; 1 &rarr; X &rarr; 0. Click a cycle number to move the cursor. Arrow keys move the cursor too.</p>
+    <div class="row" style="margin-top:8px">
+      <div><span id="pgVerdict" class="badge"></span></div>
+      <div style="flex:2"><div id="pgWalk" class="understand" style="margin:0"></div></div>
+    </div>
+    <div id="pgAttempts" class="understand" style="margin-top:8px"></div>
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label>What-if</label>
+        <div>
+          <button class="btn small" id="pgDelay">Delay response 1 cycle</button>
+          <button class="btn small" id="pgReset2">Insert reset at cursor</button>
+          <button class="btn small" id="pgHold">Hold trigger at cursor</button>
+          <button class="btn small" id="pgDrop">Remove response at cursor</button>
+        </div>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button class="btn small" id="pgExport">Copy as testbench</button>
+      </div>
+    </div>
     </div>
     <div id="pane-explain" style="display:none">
     <label for="svaIn">SystemVerilog assertions</label>
@@ -468,6 +574,21 @@ function suggestSignal(clause, known) {
   return best;
 }
 
+/* timed patterns: pulse widths, stability windows, followed-by. Returns {kind,X,Y,n} or null. */
+function parseTimed(s, known) {
+  let m;
+  m = s.match(/^\s*(.+?)\s+must\s+stay\s+high\s+for\s+at\s+least\s+(\d+)\s+cycles?\s*[.!?]?\s*$/i);
+  if (m) { const X = findSignalIn(m[1], known); if (X) return { kind: "minPulse", X: X, n: +m[2] }; }
+  m = s.match(/^\s*(.+?)\s+must\s+not\s+stay\s+high\s+for\s+more\s+than\s+(\d+)\s+cycles?\s*[.!?]?\s*$/i);
+  if (m) { const X = findSignalIn(m[1], known); if (X) return { kind: "maxPulse", X: X, n: +m[2] }; }
+  m = s.match(/^\s*(.+?)\s+must\s+remain\s+stable\s+for\s+(\d+)\s+cycles?\s+after\s+(.+?)\s+rises?\s*[.!?]?\s*$/i);
+  if (m) { const X = findSignalIn(m[1], known), Y = findSignalIn(m[3], known); if (X && Y) return { kind: "stableFor", X: X, Y: Y, n: +m[2] }; }
+  m = s.match(/^\s*(?:every|each)\s+(.+?)\s+must\s+be\s+followed\s+by\s+(.+?)\s*[.!?]?\s*$/i) ||
+      s.match(/^\s*(.+?)\s+must\s+be\s+followed\s+by\s+(.+?)\s*[.!?]?\s*$/i);
+  if (m) { const X = findSignalIn(m[1], known), Y = findSignalIn(m[2], known); if (X && Y) return { kind: "followedBy", X: X, Y: Y }; }
+  return null;
+}
+
 function extractSignals(sentence, known) {
   const found = [];
   const words = sentence.match(/[A-Za-z_][\w]*/g) || [];
@@ -490,21 +611,36 @@ function atomExpr(clause, known) {
   const agoM = t.match(/\b(\d+)\s+cycles?\s+ago\b/) || t.match(/\b(\d+)\s+cycles?\s+(before|earlier|previously)\b/);
   if (agoM) agoN = agoM[1];
   let e = null;
-  if (/\b(rises?|rose|rising edge|posedge)\b/.test(t)) e = "$rose(" + sig + ")";
-  else if (/\b(falls?|fell|falling edge|negedge)\b/.test(t)) e = "$fell(" + sig + ")";
+  const negEdge = /\bnot\b|\bn't\b|\bnever\b/.test(t);
+  if (/\b(rises?|rose|rising edge|posedge|goes?\s+high|go\s+high|comes?\s+up)\b/.test(t)) e = negEdge ? "!$rose(" + sig + ")" : "$rose(" + sig + ")";
+  else if (/\b(falls?|fell|falling edge|negedge|goes?\s+low|go\s+low)\b/.test(t)) e = negEdge ? "!$fell(" + sig + ")" : "$fell(" + sig + ")";
   else if (/\b(must\s+not\s+change|does\s+not\s+change|do\s+not\s+change|cannot\s+change|never\s+changes?)\b/.test(t)) e = "$stable(" + sig + ")";
   else if (/\b(changes?|changed|toggles?|toggled|updates?|updated)\b/.test(t)) e = "$changed(" + sig + ")";
-  else if (/\bincrements?\b/.test(t)) e = "(" + sig + " == $past(" + sig + ") + 1)";
-  else if (/\bdecrements?\b/.test(t)) e = "(" + sig + " == $past(" + sig + ") - 1)";
+  else if (/\bincrements?\b/.test(t)) {
+    const im = t.match(/\bincrements?\s+by\s+(\d+)/);
+    e = "(" + sig + " == $past(" + sig + ") + " + (im ? im[1] : "1") + ")";
+  }
+  else if (/\bdecrements?\b/.test(t)) {
+    const dm = t.match(/\bdecrements?\s+by\s+(\d+)/);
+    e = "(" + sig + " == $past(" + sig + ") - " + (dm ? dm[1] : "1") + ")";
+  }
   else if (agoN) {
     e = "$past(" + sig + ", " + agoN + ")";
     if (/\bnot\b|\bn't\b|\bnever\b/.test(t)) e = "(!" + e + ")";
   }
   else {
-    const m = t.match(/=\s*(0x[0-9a-f]+|\d+)/) || t.match(/\bequals?\s+(0x[0-9a-f]+|\d+)/);
+    const m = t.match(/=\s*(0x[0-9a-f]+|\d+)/) || t.match(/\b(?:equals?|reaches?|reached|hits?)\s+(0x[0-9a-f]+|\d+)/);
     const negWord = /\bnot\b|\bn't\b|\bnever\b/.test(t);
     let stableHit = false;
-    if (m) e = "(" + sig + " == " + m[1] + ")";
+    let sigEq = null;
+    const meq = t.match(/\b(?:equals?|is\s+equal\s+to)\s+([a-zA-Z_]\w*)/);
+    if (meq) {
+      const w = meq[1].toLowerCase();
+      known.forEach(function(k){ if (baseName(k).toLowerCase() === w && baseName(k).toLowerCase() !== baseName(sig).toLowerCase()) sigEq = k; });
+    }
+    if (m) e = "(" + sig + " == " + m[m.length - 1] + ")";
+    else if (sigEq) e = "(" + sig + " == " + sigEq + ")";
+    else if (/\b(x|unknown)\b/.test(t)) e = "$isunknown(" + sig + ")";
     else if (/\b(stable|unchanged|remains?|holds?|holding|constant|must\s+not\s+change|does\s+not\s+change|do\s+not\s+change)\b/.test(t) && !/\b(high|low|asserted|deasserted|active|inactive|enabled|disabled|set)\b/.test(t)) { e = "$stable(" + sig + ")"; stableHit = true; }
     else if (/\b(deasserted|deasserts?|low|goes low|drops?|is 0|inactive|disabled|cleared)\b/.test(t)) e = "(!" + sig + ")";
     else if (/\b(asserted|asserts?|high|goes high|is 1|active|enabled|set)\b/.test(t)) e = sig;
@@ -546,9 +682,16 @@ function clauseToExpr(clause, known) {
 /* ---------- timing words ---------- */
 
 function extractTiming(lower) {
+  lower = lower.replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\b/g, function(w){
+    return { one: "1", two: "2", three: "3", four: "4", five: "5", six: "6", seven: "7", eight: "8", nine: "9", ten: "10" }[w];
+  });
   let m = lower.match(/within\s+(\d+)\s+cycles?/);
   if (m) return { op: "##[1:" + m[1] + "]", words: "within " + m[1] + " cycles" };
+  m = lower.match(/no\s+later\s+than\s+(\d+)\s+cycles?/);
+  if (m) return { op: "##[1:" + m[1] + "]", words: "within " + m[1] + " cycles" };
   m = lower.match(/after\s+(\d+)\s+cycles?/);
+  if (m) return { op: "##" + m[1], words: m[1] + " cycles later" };
+  m = lower.match(/(\d+)\s+cycles?\s+later/);
   if (m) return { op: "##" + m[1], words: m[1] + " cycles later" };
   if (/\bin the next cycle\b|\bnext cycle\b/.test(lower)) return { op: "|=>", words: "in the next cycle" };
   if (/\bin the same cycle\b|\bsame cycle\b/.test(lower)) return { op: "|->", words: "in the same cycle" };
@@ -615,20 +758,38 @@ function parseResetValues(sentence, known) {
   return vals;
 }
 
+/* a condition that must hold on every clock edge (positive invariant) */
+function buildHold(req, X, ctx, clause) {
+  const V = verbForClause(clause || "", ctx);
+  addLevel(req, "Beginner", "b",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, X, req.sentence),
+    "The simplest form. This condition must hold on every clock edge.");
+  addLevel(req, "Intermediate", "i",
+    propLines(ctx, "p_req" + req.n, X, V.pre + "req" + req.n, V.kw),
+    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench.");
+  addLevel(req, "Advanced", "a",
+    propLines(ctx, "p_req" + req.n + "_adv", X, V.pre + "req" + req.n + "_adv", V.kw),
+    "Same check in named form. No cover point is needed for a condition that must always hold.");
+}
+
 function buildImplication(req, A, C, timing, ctx, conClause) {
   const V = verbForClause(conClause || "", ctx);
   let core;
   if (timing && timing.op === "|=>") core = A + " |=> " + C;
+  else if (timing && timing.op === "|->") core = A + " |-> " + C;
   else if (timing && timing.op === "s_eventually") core = A + " |-> s_eventually " + C;
   else if (timing) core = A + " |-> " + timing.op + " " + C;
   else core = A + " |-> " + C;
   const when = timing ? timing.words : "the same cycle";
+  const retrig = /(\$rose|\$fell)/.test(A) ? "" : " A new check starts on every cycle the left side holds; overlapping checks are independent.";
+  const pastM = (A + " " + C).match(/\$past\(\w+,\s*([2-9]\d*)\)/);
+  const pastNote = pastM ? " Note: $past with " + pastM[1] + " cycles needs that much history after reset. In the first " + pastM[1] + " cycles after reset it samples X and can fail spuriously; this property assumes the scenario only matters once that history exists." : "";
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
-    "The simplest form. Whenever the left side holds, the right side must hold " + when + ".");
+    "The simplest form. Whenever the left side holds, the right side must hold " + when + "." + retrig + pastNote);
   addLevel(req, "Intermediate", "i",
     propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
-    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench.");
+    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench." + pastNote);
   let advCore, coverCore;
   if (timing && timing.op !== "|=>" && timing.op !== "s_eventually") {
     advCore = "s_req" + req.n + "_cause |-> " + timing.op + " " + C;
@@ -648,7 +809,7 @@ function buildImplication(req, A, C, timing, ctx, conClause) {
   addLevel(req, "Advanced", "a",
     seqPart + propLines(ctx, "p_req" + req.n + "_adv", advCore, V.pre + "req" + req.n + "_adv", V.kw) +
     "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " " + coverCore + ");",
-    "Sequence based form plus a cover point, so you also prove the scenario is reachable and not vacuous.");
+    "Sequence based form plus a cover point, so you also prove the scenario is reachable and not vacuous." + pastNote);
 }
 
 function buildInvariant(req, X, ctx, clause) {
@@ -694,7 +855,7 @@ function buildStability(req, X, C, ctx) {
   const V = verbForClause(X, ctx);
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, "(" + C + ") |-> $stable(" + X + ")", req.sentence),
-    "The simplest form. While the condition holds, the signal must not change.");
+    "The simplest form. While the condition holds, the signal must not change. This includes the cycle where the condition first goes high.");
   addLevel(req, "Intermediate", "i",
     propLines(ctx, "p_req" + req.n, "(" + C + ") |-> $stable(" + X + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
@@ -740,19 +901,51 @@ function buildLiveness(req, E, ctx, clause) {
     "Same check plus a cover point proving the awaited condition is reachable.");
 }
 
+function buildTimed(req, tp, ctx) {
+  const V = verbForClause(tp.kind === "followedBy" ? tp.Y : tp.X, ctx);
+  let core, desc;
+  if (tp.kind === "minPulse") {
+    core = "$rose(" + tp.X + ") |-> " + tp.X + "[*" + tp.n + "]";
+    desc = "Every " + tp.X + " pulse is at least " + tp.n + " cycles wide.";
+  } else if (tp.kind === "maxPulse") {
+    core = "$rose(" + tp.X + ") |-> ##[1:" + tp.n + "] $fell(" + tp.X + ")";
+    desc = "Every " + tp.X + " pulse ends within " + tp.n + " cycles.";
+  } else if (tp.kind === "stableFor") {
+    core = "$rose(" + tp.Y + ") |-> $stable(" + tp.X + ")[*" + tp.n + "]";
+    desc = tp.X + " stays stable for " + tp.n + " cycles after " + tp.Y + " rises.";
+  } else {
+    core = "$rose(" + tp.X + ") |-> s_eventually $rose(" + tp.Y + ")";
+    desc = "Every " + tp.X + " pulse is eventually followed by a " + tp.Y + " pulse.";
+  }
+  addLevel(req, "Beginner", "b",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
+    "The simplest form. " + desc);
+  addLevel(req, "Intermediate", "i",
+    propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
+    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench.");
+  const D = ctx.dis ? " " + ctx.dis : "";
+  addLevel(req, "Advanced", "a",
+    propLines(ctx, "p_req" + req.n + "_adv", core, V.pre + "req" + req.n + "_adv", V.kw) +
+    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $rose(" + tp.X + "));",
+    "Same check plus a cover point, so you prove the trigger is reachable and the property is not vacuous.");
+}
+
 function buildUntil(req, A, B, ctx, clause) {
   const V = verbForClause(clause || "", ctx);
+  // Trigger on the rise of A: a bare "(A) until (B)" would fail on every
+  // cycle where A is low, because weak until still requires A until B arrives.
+  const trig = "$rose(" + A + ")";
   addLevel(req, "Beginner", "b",
-    oneLiner(ctx, V.pre + "req" + req.n, V.kw, "(" + A + ") until (" + B + ")", req.sentence),
-    "The simplest form. A must hold on every cycle until B becomes true.");
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, trig + " |-> (" + A + ") until (" + B + ")", req.sentence),
+    "The simplest form. When " + A + " rises, it must stay high on every cycle until " + B + " becomes true.");
   addLevel(req, "Intermediate", "i",
-    propLines(ctx, "p_req" + req.n, "(" + A + ") until (" + B + ")", V.pre + "req" + req.n, V.kw),
+    propLines(ctx, "p_req" + req.n, trig + " |-> (" + A + ") until (" + B + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
   const D = ctx.dis ? " " + ctx.dis : "";
   addLevel(req, "Advanced", "a",
-    propLines(ctx, "p_req" + req.n + "_adv", "(" + A + ") s_until_with (" + B + ")", V.pre + "req" + req.n + "_adv", V.kw) +
-    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " (" + A + ") ##1 (" + B + "));",
-    "Strong until, which also requires B to actually arrive, plus a cover point.");
+    propLines(ctx, "p_req" + req.n + "_adv", trig + " |-> (" + A + ") s_until_with (" + B + ")", V.pre + "req" + req.n + "_adv", V.kw) +
+    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " " + trig + ");",
+    "Strong until, which also requires " + B + " to actually arrive, plus a cover point on the trigger.");
 }
 
 </script>
@@ -1077,8 +1270,21 @@ function buildRequirements(body, ctx) {
   const skipped = [];
   sentences.forEach(function(s, idx){
     const n = idx + 1;
+    // "A unless B" reads as "A until B"
+    if (/\bunless\b/i.test(s) && !/^\s*(if|when|whenever|once)\b/i.test(s)) {
+      s = s.replace(/\bunless\b/gi, "until");
+    }
+    // "X no later than N cycles after Y" -> "When Y, X within N cycles"
+    s = s.replace(/^\s*(.+?)\s+no\s+later\s+than\s+(\d+)\s+cycles?\s+after\s+(.+?)\s*[.!?]?\s*$/i, "When $3, $1 within $2 cycles.");
     const t = " " + s.toLowerCase() + " ";
     const sigs = extractSignals(s, known);
+
+    // multi-clock / CDC: never guess, always skip with a reason
+    if (/\bclock\s+domain\b|\bcdc\b|metastab/i.test(t)) {
+      skipped.push({ n: n, sentence: s,
+        reason: "This requirement spans clock domains. Clock-domain crossing needs dedicated CDC methodology (synchronizer chains, handshake protocols), which this tool does not generate. It was skipped rather than guessed." });
+      return;
+    }
 
     // reset
     if (/\breset\b/.test(t)) {
@@ -1131,6 +1337,24 @@ function buildRequirements(body, ctx) {
       const A = clauseToExpr(m[2], known), C = clauseToExpr(m[3], known);
       const timing = extractTiming(t);
       if (A && C) {
+        // "becomes <VALUE>" with an unmapped value name: do not drop the value silently
+        if (/\bbecomes\s+(?!high\b|low\b|active\b|inactive\b)(\w+)/i.test(m[3]) && /^\(?\w+\)?$/.test(C)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "'" + m[3].trim() + "' assigns a value ('becomes X') that is not mapped to a signal encoding. It was skipped rather than guessed." });
+          return;
+        }
+        // timeout shape: something does NOT happen within N cycles -> needs explicit formulation
+        if (timing && /!\$rose|!\$fell/.test(A)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "Timeout requirements (no response within N cycles) need an explicit timeout formulation. It was skipped rather than guessed." });
+          return;
+        }
+        // "within" with no readable bound: the delay was dropped, do not silently weaken
+        if (!timing && /\bwithin\b/i.test(t)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "The delay bound is parameterized or unreadable ('within N cycles' needs a concrete number). It was skipped rather than guessed." });
+          return;
+        }
         const req = mkReq(n, s, "implication",
           "If " + m[2].trim() + ", then " + m[3].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
         buildImplication(req, A, C, timing, ctx, m[3]);
@@ -1158,6 +1382,14 @@ function buildRequirements(body, ctx) {
         return;
       }
     }
+    // timed patterns: pulse widths, stability windows, followed-by (before invariant, so "must not stay high for more than N" is caught)
+    const tp = parseTimed(s, known);
+    if (tp) {
+      const req = mkReq(n, s, "timed", "Timed pattern.");
+      buildTimed(req, tp, ctx);
+      reqs.push(req);
+      return;
+    }
     // invariant: never / must not
     if (/\b(never|must\s+not|shall\s+not|cannot|can't)\b/.test(t)) {
       const core = s.replace(/\b(must\s+never|never|shall\s+not|must\s+not|cannot|can't)\b/gi, " ");
@@ -1183,6 +1415,24 @@ function buildRequirements(body, ctx) {
         }
       }
     }
+    // "C does something while D holds" -> D implies C (after stability's own while handling)
+    m = s.match(/^\s*(.+?)\s+while\s+(.+?)[.!?]?\s*$/i);
+    if (m) {
+      const A = clauseToExpr(m[2], known), C = clauseToExpr(m[1], known);
+      const timing = extractTiming(t);
+      if (A && C) {
+        if (!timing && /\bwithin\b/i.test(t)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "The delay bound is parameterized or unreadable ('within N cycles' needs a concrete number). It was skipped rather than guessed." });
+          return;
+        }
+        const req = mkReq(n, s, "implication",
+          "While " + m[2].trim() + ", " + m[1].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
+        buildImplication(req, A, C, timing, ctx, m[1]);
+        reqs.push(req);
+        return;
+      }
+    }
     // "X holds when/if Y"  ->  Y implies X
     m = s.match(/^\s*(.+?)\s+(when|if)\s+(.+?)[.!?]?\s*$/i);
     if (m) {
@@ -1202,7 +1452,20 @@ function buildRequirements(body, ctx) {
           (sug ? " Did you mean '" + sug + "'?" : " Check the spelling against your signal list.") });
       return;
     }
-    // generic: whole sentence as one boolean condition
+    // state-value transitions need explicit encodings, never guessed
+    if (/\b(changes?\s+from|goes\s+from|transitions?\s+from)\b/i.test(t)) {
+      skipped.push({ n: n, sentence: s,
+        reason: "State-value transitions (change from X to Y) need explicit value encodings, which the tool does not infer from names like IDLE or BUSY. It was skipped rather than guessed." });
+      return;
+    }
+    // "After N cycles" with no reference point is ambiguous
+    if (/^\s*after\s+\d+\s+cycles?\s*,/i.test(s)) {
+      skipped.push({ n: n, sentence: s,
+        reason: "'After N cycles' needs a reference point, for example 'after reset' or 'after req rises'. It was skipped rather than guessed." });
+      return;
+    }
+    // generic: whole sentence as one boolean condition, positive hold only.
+    // Anything with unhandled temporal or sequencing words is skipped, never guessed.
     const E = clauseToExpr(s, known);
     const timingG = extractTiming(t);
     if (E && timingG && timingG.op === "s_eventually") {
@@ -1212,8 +1475,13 @@ function buildRequirements(body, ctx) {
       return;
     }
     if (E) {
-      const req = mkReq(n, s, "invariant", "Read as a condition that must always hold: " + E + ".");
-      buildInvariant(req, E, ctx, s);
+      if (/\b(stay|stays|stayed|remain|remains|change|changes|changed|follow|followed|following|pulse|width|within|after|before|ago|until|while|during|every|each|more\s+than|at\s+least|for\s+\d+\s+cycles?|becomes|unless)\b/i.test(t)) {
+        skipped.push({ n: n, sentence: s,
+          reason: "This requirement uses timing or sequencing the tool cannot model yet. It was skipped rather than guessed. Rephrase with an explicit trigger and delay, for example 'When req rises, ack rises within 3 cycles.'" });
+        return;
+      }
+      const req = mkReq(n, s, "hold", "This condition must hold on every clock edge: " + E + ".");
+      buildHold(req, E, ctx, s);
       reqs.push(req);
       return;
     }
@@ -1450,6 +1718,9 @@ function doGenerate(force, specOverride) {
   currentSkipped = out.skipped;
   currentNotes = gate.notes;
   render();
+  try { pgRefreshSrc(); } catch (e) {}
+  try { bdFillSelects(); bdPreview(); } catch (e) {}
+  try { ambRender(); } catch (e) {}
 }
 
 let activeTab = "spec";
@@ -1459,7 +1730,7 @@ function setTab(t) {
   for (let i = 0; i < tabs.length; i++) {
     tabs[i].className = "tab" + (tabs[i].getAttribute("data-tab") === t ? " active" : "");
   }
-  ["spec", "wave", "explain"].forEach(function(k){
+  ["spec", "wave", "play", "explain"].forEach(function(k){
     $("pane-" + k).style.display = k === t ? "block" : "none";
   });
 }
@@ -1637,6 +1908,9 @@ try {
       $("signals").value = ex.signals;
     }
     doGenerate();
+    try { pgInit(); } catch (e) {}
+    try { pgRefreshSrc(); } catch (e) {}
+    try { bdInit(); } catch (e) {}
   })();
 } catch (err) {
   $("emptyState").style.display = "block";
@@ -1655,6 +1929,718 @@ $("shareLink").onclick = function(){
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, done);
   else done();
 };
+
+/* ================= bundled: SVA reference evaluator + playground ================= */
+/* ================= SVA reference evaluator (JS) =================
+   Cycle-based model of the spec2sva-supported SVA subset. This is NOT a
+   SystemVerilog simulator; it is a straightforward reference model used by the
+   waveform playground to illustrate pass/fail/vacuous behavior.
+   Supported: |-> |=> ##N ##[a:b] [*N] s_eventually until(weak)
+   $rose $fell $stable $past $onehot0 $isunknown ! && || == != + -
+   Trace: {sig: [0|1|null,...]}, null = X. Returns per-cycle attempts. */
+
+function svaTokenize(s) {
+  const re = /\s*(\|->|\|=>|##|&&|\|\||==|!=|[A-Za-z_$][\w$]*|\d+|[()\[\]{},:!*+\-])/g;
+  const toks = [];
+  let m, last = 0;
+  const stripped = s;
+  while ((m = re.exec(stripped)) !== null) {
+    if (m.index !== last && /[^\s]/.test(stripped.slice(last, m.index)))
+      throw new Error("bad token at " + stripped.slice(last, last + 20));
+    last = m.index + m[0].length;
+    toks.push(m[1]);
+  }
+  return toks;
+}
+
+function svaParse(s) {
+  const t = svaTokenize(s);
+  let i = 0;
+  const peek = () => t[i] || "";
+  const next = () => t[i++];
+  function expect(v) { const p = next(); if (p !== v) throw new Error("expected " + v + " got " + p); }
+
+  function prop() {
+    const a = seq();
+    const p = peek();
+    if (p === "|->" || p === "|=>") {
+      next();
+      let b = seq();
+      if (peek() === "until") { next(); b = { k: "until", a: b, b: seq() }; }
+      return { k: "impl", op: p, a: a, b: b };
+    }
+    if (p === "until") { next(); return { k: "until", a: a, b: seq() }; }
+    return a;
+  }
+  function seq() {
+    let first = null;
+    if (peek() !== "##") {
+      first = term();
+      if (peek() === "|->") {
+        next();
+        if (peek() === "s_eventually") { next(); return { k: "impl", op: "|->", a: first, b: { k: "eventually", b: seq() } }; }
+        i--;
+      }
+    }
+    const items = [first];
+    while (peek() === "##") {
+      next();
+      items.push([delay(), term()]);
+    }
+    if (items.length === 1 && first !== null) return first;
+    return { k: "seq", items: items };
+  }
+  function delay() {
+    const p = next();
+    if (p === "[") {
+      const a = parseInt(next(), 10); expect(":"); const b = parseInt(next(), 10); expect("]");
+      return [a, b];
+    }
+    return [parseInt(p, 10), parseInt(p, 10)];
+  }
+  function term() {
+    let base = termBase();
+    if (peek() === "[") {
+      next();
+      if (peek() === "*") {
+        next(); const n = parseInt(next(), 10); expect("]");
+        return { k: "rep", base: base, n: n };
+      }
+      i--;
+    }
+    return base;
+  }
+  function termBase() {
+    const p = peek();
+    if (p === "!") { next(); return { k: "not", e: termBase() }; }
+    if (p === "(") { next(); const e = prop(); expect(")"); return e; }
+    if (/^\$/.test(p)) return sysfunc();
+    return bexpr();
+  }
+  function sysfunc() {
+    const f = next(); expect("(");
+    const id = () => { const p = next(); if (!/^[A-Za-z_]/.test(p)) throw new Error("expected id"); return p; };
+    if (f === "$rose" || f === "$fell" || f === "$stable" || f === "$isunknown") {
+      const a = id(); expect(")"); return { k: f.slice(1), sig: a };
+    }
+    if (f === "$past") {
+      const a = id(); let n = 1;
+      if (peek() === ",") { next(); n = parseInt(next(), 10); }
+      expect(")"); return { k: "past", sig: a, n: n };
+    }
+    if (f === "$onehot0") {
+      expect("{"); const args = [id()];
+      while (peek() === ",") { next(); args.push(id()); }
+      expect("}"); expect(")"); return { k: "onehot0", args: args };
+    }
+    throw new Error("unsupported " + f);
+  }
+  function bexpr() {
+    let e = band();
+    while (peek() === "||") { next(); e = { k: "or", a: e, b: band() }; }
+    return e;
+  }
+  function band() {
+    let e = beq();
+    while (peek() === "&&") { next(); e = { k: "and", a: e, b: beq() }; }
+    return e;
+  }
+  function beq() {
+    let e = barith();
+    const p = peek();
+    if (p === "==" || p === "!=") { next(); e = { k: p === "==" ? "eq" : "ne", a: e, b: barith() }; }
+    return e;
+  }
+  function barith() {
+    let e = bnot();
+    while (peek() === "+" || peek() === "-") { const op = next(); e = { k: "arith", op: op, a: e, b: bnot() }; }
+    return e;
+  }
+  function bnot() {
+    if (peek() === "!") { next(); return { k: "not", e: bnot() }; }
+    const p = peek();
+    if (/^\$/.test(p)) return sysfunc();
+    const q = next();
+    if (/^\d+$/.test(q)) return { k: "lit", v: parseInt(q, 10) };
+    if (/^[A-Za-z_]/.test(q)) return { k: "sig", sig: q };
+    if (q === "(") { const e = bexpr(); expect(")"); return e; }
+    throw new Error("unexpected " + q);
+  }
+  const e = prop();
+  if (i < t.length) throw new Error("trailing tokens: " + t.slice(i).join(" "));
+  return e;
+}
+
+function svaSig(trace, sig, tt) {
+  const v = trace[sig];
+  if (!v || tt < 0 || tt >= v.length) return null;
+  return v[tt];
+}
+
+function svaBval(e, trace, tt) {
+  switch (e.k) {
+    case "sig": return svaSig(trace, e.sig, tt);
+    case "lit": return e.v;
+    case "not": { const v = svaBval(e.e, trace, tt); return v === null ? null : (v ? 0 : 1); }
+    case "and": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
+      if (a === 0 || b === 0) return 0; if (a === null || b === null) return null; return 1; }
+    case "or": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
+      if (a === 1 || b === 1) return 1; if (a === null || b === null) return null; return 0; }
+    case "eq": case "ne": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
+      if (a === null || b === null) return null;
+      const r = a === b ? 1 : 0; return e.k === "eq" ? r : (r ? 0 : 1); }
+    case "arith": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
+      if (a === null || b === null) return null; return e.op === "+" ? a + b : a - b; }
+    case "rose": { const c = svaSig(trace, e.sig, tt), p = svaSig(trace, e.sig, tt - 1);
+      if (c === null || p === null) return null; return (c === 1 && p === 0) ? 1 : 0; }
+    case "fell": { const c = svaSig(trace, e.sig, tt), p = svaSig(trace, e.sig, tt - 1);
+      if (c === null || p === null) return null; return (c === 0 && p === 1) ? 1 : 0; }
+    case "stable": { const c = svaSig(trace, e.sig, tt), p = svaSig(trace, e.sig, tt - 1);
+      if (c === null || p === null) return null; return c === p ? 1 : 0; }
+    case "past": return svaSig(trace, e.sig, tt - e.n);
+    case "isunknown": { const v = svaSig(trace, e.sig, tt); return v === null ? 1 : 0; }
+    case "onehot0": { const vs = e.args.map(s => svaSig(trace, s, tt));
+      if (vs.some(v => v === null)) return null; return vs.reduce((x, y) => x + y, 0) <= 1 ? 1 : 0; }
+    default: throw new Error("eval " + e.k);
+  }
+}
+
+function svaRst(rst, tt) {
+  if (!rst || tt < 0 || tt >= rst.length) return false;
+  return rst[tt] === 0;
+}
+
+/* match a sequence; items[0] is term|null(rep)|null(leading delay) */
+function svaSeqMatch(items, trace, t, rst, ncyc) {
+  function repOk(term, tt) {
+    if (term.k !== "rep") return svaBval(term, trace, tt) === 1 && !svaRst(rst, tt);
+    for (let k = 0; k < term.n; k++) {
+      if (svaBval(term.base, trace, tt + k) !== 1 || svaRst(rst, tt + k)) return false;
+    }
+    return true;
+  }
+  function repEnd(term, tt) { return term.k === "rep" ? tt + term.n - 1 : tt; }
+  const first = items[0];
+  let cur, idx;
+  if (first === null) { cur = t; idx = 1; }
+  else if (!repOk(first, t)) return { ok: false, end: t };
+  else { cur = repEnd(first, t); idx = 1; }
+  for (let j = idx; j < items.length; j++) {
+    const d = items[j][0], term = items[j][1];
+    let found = -1;
+    for (let dd = d[0]; dd <= d[1]; dd++) {
+      const tt = cur + dd;
+      if (tt >= ncyc) break;
+      let killed = false;
+      for (let x = cur + 1; x <= tt; x++) if (svaRst(rst, x)) { killed = true; break; }
+      if (killed) continue;
+      if (repOk(term, tt)) { found = tt; break; }
+    }
+    if (found < 0) return { ok: false, end: cur };
+    cur = repEnd(term, found);
+  }
+  return { ok: true, end: cur };
+}
+
+function svaUntilOk(a, b, trace, t0, ncyc, rst) {
+  for (let t2 = t0; t2 < ncyc; t2++) {
+    if (svaRst(rst, t2)) return { ok: true, end: t2 };
+    if (svaBval(b, trace, t2) === 1) return { ok: true, end: t2 };
+    if (svaBval(a, trace, t2) !== 1) return { ok: false, end: t2 };
+  }
+  return { ok: true, end: ncyc - 1 };
+}
+
+/* Full check. Returns {verdict, attempts:[{t, result, end, detail}]}.
+   result: pass|fail|vacuous-killed. verdict: PASS|FAIL|VACUOUS|ERROR */
+function svaCheck(core, trace, ncyc, rstName) {
+  let ast;
+  try { ast = svaParse(core); }
+  catch (err) { return { verdict: "ERROR", attempts: [], detail: String(err.message || err) }; }
+  const rst = rstName ? (trace[rstName] || null) : null;
+  const attempts = [];
+  function note(t, result, end, detail) { attempts.push({ t: t, result: result, end: end, detail: detail }); }
+  if (ast.k === "impl") {
+    for (let t = 0; t < ncyc; t++) {
+      if (svaRst(rst, t)) continue;
+      if (svaBval(ast.a, trace, t) !== 1) continue;
+      const t0 = t + (ast.op === "|=>" ? 1 : 0);
+      let r;
+      if (ast.b.k === "eventually") {
+        let ok = false, end = t0;
+        for (let tt = t0; tt < ncyc; tt++) {
+          if (svaRst(rst, tt)) break;
+          if (svaBval(ast.b.b, trace, tt) === 1) { ok = true; end = tt; break; }
+        }
+        r = ok ? { ok: true, end: end } : { ok: false, end: t0 };
+        note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "completed" : "never completed");
+        if (!r.ok) return { verdict: "FAIL", attempts: attempts };
+      } else if (ast.b.k === "until") {
+        r = svaUntilOk(ast.b.a, ast.b.b, trace, t0, ncyc, rst);
+        note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "until held" : "until broken");
+        if (!r.ok) return { verdict: "FAIL", attempts: attempts };
+      } else {
+        const items = ast.b.k === "seq" ? ast.b.items : [ast.b];
+        r = svaSeqMatch(items, trace, t0, rst, ncyc);
+        note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "completed" : "no match");
+        if (!r.ok) return { verdict: "FAIL", attempts: attempts };
+      }
+    }
+  } else if (ast.k === "until") {
+    const r = svaUntilOk(ast.a, ast.b, trace, 0, ncyc, rst);
+    note(0, r.ok ? "pass" : "fail", r.end, r.ok ? "until held" : "until broken");
+    if (!r.ok) return { verdict: "FAIL", attempts: attempts };
+  } else {
+    for (let t = 0; t < ncyc; t++) {
+      if (svaRst(rst, t)) continue;
+      const items = ast.k === "seq" ? ast.items : [ast];
+      const r = svaSeqMatch(items, trace, t, rst, ncyc);
+      note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "holds" : "violated");
+      if (!r.ok) return { verdict: "FAIL", attempts: attempts };
+    }
+  }
+  if (!attempts.length) return { verdict: "VACUOUS", attempts: attempts };
+  return { verdict: "PASS", attempts: attempts };
+}
+
+/* ================= playground ================= */
+const PG_NCYC = 12;
+const PG_EXAMPLES = [
+  { name: "Handshake", core: "$rose(req) |-> ##[1:3] $rose(ack)", sigs: ["req", "ack"],
+    trace: { req: [0,0,1,0,0,0,0,0,0,0,0,0], ack: [0,0,0,0,1,0,0,0,0,0,0,0] },
+    blurb: "req rises, ack answers within 3 cycles" },
+  { name: "Pulse width", core: "$rose(irq) |-> irq[*4]", sigs: ["irq"],
+    trace: { irq: [0,0,1,1,1,1,0,0,0,0,0,0] },
+    blurb: "every irq pulse is at least 4 cycles wide" },
+  { name: "Stability", core: "(req) |-> $stable(gnt)", sigs: ["req", "gnt"],
+    trace: { req: [0,1,1,1,0,0,0,0,0,0,0,0], gnt: [0,1,1,1,1,0,0,0,0,0,0,0] },
+    blurb: "gnt holds steady while req is high" },
+  { name: "Mutex", core: "$onehot0({gnt0, gnt1})", sigs: ["gnt0", "gnt1"],
+    trace: { gnt0: [0,0,1,1,0,0,0,0,0,0,0,0], gnt1: [0,0,0,0,1,1,0,0,0,0,0,0] },
+    blurb: "grants never overlap" },
+  { name: "Until", core: "$rose(req) |-> (req) until ($rose(ack))", sigs: ["req", "ack"],
+    trace: { req: [0,0,1,1,1,0,0,0,0,0,0,0], ack: [0,0,0,0,1,0,0,0,0,0,0,0] },
+    blurb: "req stays up until ack rises" },
+  { name: "Past history", core: "valid |-> $past(data, 2)", sigs: ["valid", "data"],
+    trace: { valid: [0,0,0,0,1,0,0,0,0,0,0,0], data: [0,0,1,0,0,0,0,0,0,0,0,0] },
+    blurb: "data was high 2 cycles ago" }
+];
+let pg = null;
+
+function pgBlankTrace(sigs) {
+  const t = { rst_n: [] };
+  for (let i = 0; i < PG_NCYC; i++) t.rst_n.push(1);
+  sigs.forEach(function(s){ t[s] = []; for (let i = 0; i < PG_NCYC; i++) t[s].push(0); });
+  return t;
+}
+function pgFillTrace(sigs, given) {
+  const t = pgBlankTrace(sigs);
+  Object.keys(given || {}).forEach(function(s){
+    if (!t[s]) return;
+    for (let i = 0; i < PG_NCYC && i < given[s].length; i++) t[s][i] = given[s][i];
+  });
+  return t;
+}
+function pgReqCore(req) {
+  const lvl = (req.levels || []).find(function(l){ return l.tag === "Intermediate"; });
+  if (!lvl) return null;
+  const m = lvl.code.match(/@\([^)]*\)(?:\s*disable\s+iff\s*\([^)]*\))?\s*\n?\s*([\s\S]*?);\s*\nendproperty/);
+  if (!m) return null;
+  let core = m[1].trim();
+  const w = core.match(/^\(\((.*?)\)\)\s*\|->\s*\(([\s\S]*)\)$/);
+  if (w) core = w[2].trim();
+  return core;
+}
+function pgCoreSignals(core) {
+  const ids = core.match(/\$?[A-Za-z_]\w*/g) || [];
+  const known = (currentCtx ? currentCtx.signals : []).map(function(s){ return s.name; });
+  const out = [];
+  ids.forEach(function(id){
+    if (id.charAt(0) === "$") return;
+    const hit = known.find(function(k){ return baseName(k).toLowerCase() === id.toLowerCase(); });
+    if (hit && out.indexOf(hit) < 0) out.push(hit);
+  });
+  return out;
+}
+function pgAstSigs(node, out) {
+  out = out || [];
+  if (!node || typeof node !== "object") return out;
+  if (node.sig) out.push(node.sig);
+  if (node.args) node.args.forEach(function(a){ out.push(a); });
+  ["a", "b", "e", "base"].forEach(function(k){ if (node[k]) pgAstSigs(node[k], out); });
+  if (node.items) node.items.forEach(function(it){ pgAstSigs(Array.isArray(it) ? it[1] : it, out); });
+  return out;
+}
+function pgTrigResp(core) {
+  try {
+    const ast = svaParse(core);
+    if (ast.k === "impl") {
+      const ta = pgAstSigs(ast.a), tb = pgAstSigs(ast.b);
+      return { trigger: ta[0] || null, response: tb[0] || null, ast: ast };
+    }
+    return { trigger: null, response: pgAstSigs(ast)[0] || null, ast: ast };
+  } catch (e) { return { trigger: null, response: null, ast: null }; }
+}
+function pgLoad(name, core, sigs, trace) {
+  pg = { name: name, core: core, sigs: sigs.slice(),
+    trace: pgFillTrace(sigs, trace), cursor: 0 };
+  const tr = pgTrigResp(core);
+  pg.trigger = tr.trigger; pg.response = tr.response; pg.ast = tr.ast;
+  pgRender();
+}
+function pgLoadExample(ex) { pgLoad("Example: " + ex.name, ex.core, ex.sigs, ex.trace); }
+function pgLoadReq(req) {
+  const core = pgReqCore(req);
+  if (!core) return;
+  const sigs = pgCoreSignals(core).slice(0, 4);
+  pgLoad("Requirement " + req.n, core, sigs, null);
+}
+function pgRefreshSrc() {
+  const sel = $("pgSrc");
+  sel.innerHTML = "";
+  PG_EXAMPLES.forEach(function(ex, i){
+    const o = document.createElement("option");
+    o.value = "ex" + i; o.textContent = "Example: " + ex.name + " (" + ex.blurb + ")";
+    sel.appendChild(o);
+  });
+  (current || []).forEach(function(req){
+    if (!pgReqCore(req)) return;
+    const o = document.createElement("option");
+    o.value = "req" + req.n;
+    o.textContent = "Requirement " + req.n + ": " + req.sentence.slice(0, 60);
+    sel.appendChild(o);
+  });
+}
+function pgValCell(v) { return v === null ? "x" : String(v); }
+function pgRender() {
+  if (!pg) return;
+  $("pgCore").textContent = "assert property (@(posedge clk) " + pg.core + ");";
+  // description via the reverse explainer
+  let desc = "";
+  try {
+    const r = explainSva("a1: assert property (@(posedge clk) " + pg.core + ");");
+    if (r && r[0] && r[0].english) desc = r[0].english;
+  } catch (e) {}
+  const res = svaCheck(pg.core, pg.trace, PG_NCYC, "rst_n");
+  pg.last = res;
+  // verdict badge
+  const vb = $("pgVerdict");
+  const fired = res.attempts.length;
+  if (res.verdict === "PASS") { vb.className = "badge pass"; vb.textContent = "PASS" + (fired ? " (" + fired + " checks)" : ""); }
+  else if (res.verdict === "FAIL") { vb.className = "badge fail"; vb.textContent = "FAIL"; }
+  else if (res.verdict === "VACUOUS") { vb.className = "badge vac"; vb.textContent = "VACUOUS (never triggered)"; }
+  else { vb.className = "badge err"; vb.textContent = "ERROR"; }
+  // grid
+  const tbl = $("pgGrid");
+  tbl.innerHTML = "";
+  const hr = document.createElement("tr");
+  const hc = document.createElement("th"); hc.textContent = "cycle"; hr.appendChild(hc);
+  for (let c = 0; c < PG_NCYC; c++) {
+    const th = document.createElement("th");
+    th.textContent = c; th.setAttribute("data-c", c);
+    if (c === pg.cursor) th.className = "cur";
+    th.onclick = (function(cc){ return function(){ pg.cursor = cc; pgRender(); }; })(c);
+    hr.appendChild(th);
+  }
+  tbl.appendChild(hr);
+  const rows = ["rst_n"].concat(pg.sigs);
+  rows.forEach(function(s){
+    const tr = document.createElement("tr");
+    const lab = document.createElement("td");
+    lab.className = "sig"; lab.textContent = s;
+    tr.appendChild(lab);
+    for (let c = 0; c < PG_NCYC; c++) {
+      const td = document.createElement("td");
+      const v = pg.trace[s][c];
+      td.className = "cell" + (v === 1 ? " v1" : v === null ? " vx" : "") + (c === pg.cursor ? " curcol" : "");
+      td.textContent = pgValCell(v);
+      td.onclick = (function(ss, cc){ return function(){
+        const cur = pg.trace[ss][cc];
+        pg.trace[ss][cc] = cur === 0 ? 1 : cur === 1 ? null : 0;
+        pgRender();
+      }; })(s, c);
+      tr.appendChild(td);
+    }
+    tbl.appendChild(tr);
+  });
+  // walkthrough at cursor
+  const c = pg.cursor;
+  let walk = "<b>Cycle " + c + ".</b> ";
+  if (res.verdict === "ERROR") {
+    walk += "The reference model could not parse this assertion: " + (res.detail || "") + ".";
+  } else if (pg.ast && pg.ast.k === "impl") {
+    const av = svaBval(pg.ast.a, pg.trace, c);
+    walk += "Antecedent evaluates to <b>" + (av === null ? "X" : av) + "</b>. ";
+    const att = res.attempts.find(function(a){ return a.t === c; });
+    if (att) {
+      walk += "A check starts here and " +
+        (att.result === "pass" ? "<b>passed</b> (ended cycle " + att.end + ")."
+        : "<b>failed</b> (" + att.detail + ").");
+    } else if (av === 1) {
+      walk += "A check starts here; it is still open or was killed by reset.";
+    } else {
+      walk += "No check starts on this cycle.";
+    }
+  } else {
+    const att = res.attempts.find(function(a){ return a.t === c; });
+    if (att) walk += "This cycle " + (att.result === "pass" ? "<b>passed</b>." : "<b>failed</b> (" + att.detail + ").");
+    else walk += "No violation on this cycle.";
+  }
+  if (desc) walk += "<br><span style='color:#6b6455'>" + desc + "</span>";
+  $("pgWalk").innerHTML = walk;
+  // attempts + coverage
+  let ah = "";
+  if (res.verdict === "VACUOUS") {
+    ah = "The trigger never fired on this trace, so the property is <b>vacuous</b>: it passes without ever checking anything. Drive the trigger signal to get a real check.";
+  } else if (res.attempts.length) {
+    ah = res.attempts.map(function(a){
+      return "c" + a.t + ": " + (a.result === "pass" ? "PASS" : "FAIL") +
+        " (ended c" + a.end + (a.detail ? ", " + a.detail : "") + ")";
+    }).join("<br>");
+    if (res.verdict === "PASS") ah += "<br>The trigger fired " + res.attempts.length + " time(s); every check passed. Not vacuous.";
+  }
+  if (res.detail && res.verdict === "ERROR") ah = res.detail;
+  $("pgAttempts").innerHTML = ah;
+  $("pgAttempts").style.display = ah ? "" : "none";
+}
+function pgShift(sig, fromC, by) {
+  const v = pg.trace[sig], nv = v.slice();
+  for (let c = PG_NCYC - 1; c >= fromC; c--) {
+    nv[c] = c - by >= fromC ? v[c - by] : v[fromC];
+  }
+  pg.trace[sig] = nv;
+}
+function pgInit() {
+  pgRefreshSrc();
+  $("pgSrc").onchange = function(){
+    const v = $("pgSrc").value;
+    if (v.indexOf("ex") === 0) pgLoadExample(PG_EXAMPLES[+v.slice(2)]);
+    else {
+      const req = (current || []).find(function(r){ return ("req" + r.n) === v; });
+      if (req) pgLoadReq(req);
+    }
+  };
+  pgLoadExample(PG_EXAMPLES[0]);
+  $("pgResetTrace").onclick = function(){
+    const v = $("pgSrc").value;
+    if (v.indexOf("ex") === 0) pgLoadExample(PG_EXAMPLES[+v.slice(2)]);
+    else {
+      const req = (current || []).find(function(r){ return ("req" + r.n) === v; });
+      if (req) pgLoadReq(req);
+    }
+  };
+  document.addEventListener("keydown", function(e){
+    if ($("pane-play").style.display === "none") return;
+    if (e.key === "ArrowLeft" && pg) { pg.cursor = Math.max(0, pg.cursor - 1); pgRender(); }
+    if (e.key === "ArrowRight" && pg) { pg.cursor = Math.min(PG_NCYC - 1, pg.cursor + 1); pgRender(); }
+  });
+  $("pgDelay").onclick = function(){
+    if (!pg || !pg.response) return;
+    pgShift(pg.response, pg.cursor, 1);
+    pgRender();
+  };
+  $("pgReset2").onclick = function(){
+    if (!pg) return;
+    pg.trace.rst_n[pg.cursor] = 0;
+    if (pg.cursor + 1 < PG_NCYC) pg.trace.rst_n[pg.cursor + 1] = 0;
+    pgRender();
+  };
+  $("pgHold").onclick = function(){
+    if (!pg || !pg.trigger) return;
+    for (let c = pg.cursor; c < Math.min(PG_NCYC, pg.cursor + 4); c++) pg.trace[pg.trigger][c] = 1;
+    pgRender();
+  };
+  $("pgDrop").onclick = function(){
+    if (!pg || !pg.response) return;
+    for (let c = pg.cursor; c < PG_NCYC; c++) pg.trace[pg.response][c] = 0;
+    pgRender();
+  };
+  $("pgExport").onclick = function(){
+    if (!pg) return;
+    const sigs = ["rst_n"].concat(pg.sigs);
+    let out = "// Trace exported from the spec2sva playground\n// Property: " + pg.core + "\n";
+    out += "initial begin\n";
+    for (let c = 0; c < PG_NCYC; c++) {
+      const vals = sigs.map(function(s){
+        const v = pg.trace[s][c];
+        return "  " + s + " = 1'b" + (v === null ? "x" : v) + ";";
+      }).join(" ");
+      out += "  // cycle " + c + "\n " + vals + " @(posedge clk);\n";
+    }
+    out += "end\n";
+    const done = function(){ $("pgExport").textContent = "Copied"; setTimeout(function(){ $("pgExport").textContent = "Copy as testbench"; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(out).then(done, done);
+    else done();
+  };
+}
+
+
+/* ================= bundled: guided builder + ambiguity resolver ================= */
+/* ================= guided requirement builder ================= */
+function bdSignalNames() {
+  const fromCtx = (currentCtx ? currentCtx.signals : []).map(function(s){ return s.name; });
+  const fromBox = $("signals").value.split("\n").map(function(l){ return l.trim(); }).filter(Boolean);
+  const out = [];
+  fromCtx.concat(fromBox).forEach(function(n){ if (out.indexOf(n) < 0) out.push(n); });
+  return out;
+}
+function bdFillSelects() {
+  const names = bdSignalNames();
+  ["bdA", "bdB"].forEach(function(id, k){
+    const sel = $(id), cur = sel.value;
+    sel.innerHTML = "";
+    if (!names.length) {
+      const o = document.createElement("option"); o.textContent = "(add signals below)"; sel.appendChild(o);
+      return;
+    }
+    names.forEach(function(n){
+      const o = document.createElement("option"); o.value = n; o.textContent = n;
+      sel.appendChild(o);
+    });
+    sel.value = cur && names.indexOf(cur) >= 0 ? cur : names[k === 0 ? 0 : Math.min(1, names.length - 1)];
+  });
+}
+function bdEnglish() {
+  const A = $("bdA").value, B = $("bdB").value;
+  if (!A || !B) return "";
+  const aw = { rises: "rises", falls: "falls", high: "is high", low: "is low" }[$("bdATrig").value];
+  const bw = { rises: "rises", falls: "falls", high: "is high", low: "is low", stable: "remains stable" }[$("bdBPred").value];
+  const t = $("bdT").value, n = Math.max(1, parseInt($("bdN").value, 10) || 3);
+  const tw = { same: "in the same cycle", next: "in the next cycle", within: "within " + n + " cycles",
+    after: n + " cycles later", eventually: "eventually" }[t];
+  return "When " + A + " " + aw + ", " + B + " " + bw + " " + tw + ".";
+}
+function bdPreview() {
+  const eng = bdEnglish();
+  $("bdEnglish").textContent = eng || "(pick two signals below to start)";
+  let sva = "";
+  try {
+    if (eng && currentCtx) {
+      const known = currentCtx.signals.map(function(s){ return s.name; });
+      const m = eng.match(/^\s*when\s+(.+?),\s*(.+?)\s*\.\s*$/i);
+      if (m) {
+        const A = clauseToExpr(m[1], known), C = clauseToExpr(m[2], known);
+        const timing = extractTiming(" " + eng.toLowerCase() + " ");
+        if (A && C) {
+          const req = { n: 0, sentence: eng, levels: [] };
+          buildImplication(req, A, C, timing, currentCtx, m[2]);
+          const lvl = req.levels.filter(function(l){ return l.tag === "Beginner"; })[0];
+          if (lvl) sva = lvl.code.split("\n").filter(function(l){ return /assert|assume/.test(l); }).join("\n");
+        }
+      }
+    }
+  } catch (e) {}
+  $("bdSva").textContent = sva || "The SVA preview appears once you generate the spec below.";
+}
+function bdInit() {
+  bdFillSelects();
+  ["bdA","bdATrig","bdB","bdBPred","bdT","bdN"].forEach(function(id){
+    $(id).addEventListener("change", bdPreview);
+    $(id).addEventListener("input", bdPreview);
+  });
+  $("bdAdd").onclick = function(){
+    const eng = bdEnglish();
+    if (!eng) return;
+    const spec = $("spec").value;
+    $("spec").value = spec.replace(/\s+$/, "") + "\n  " + eng + "\n";
+    doGenerate();
+    bdFillSelects();
+  };
+  bdPreview();
+}
+
+/* ================= ambiguity resolver ================= */
+function ambFind() {
+  const out = [];
+  (current || []).forEach(function(req){
+    const core = pgReqCore(req);
+    if (!core) return;
+    // 1. bare "until (sig)" vs "until ($rose(sig))"
+    let m = core.match(/until\s*\(\s*([A-Za-z_]\w*)\s*\)/);
+    if (m) {
+      out.push({ req: req, kind: "until",
+        title: "Requirement " + req.n + ": what does \u201cuntil " + m[1] + "\u201d mean?",
+        body: "Two readings are common. Pick the one you meant; the spec text will be rewritten and regenerated.",
+        options: [
+          { label: "Until " + m[1] + " rises (edge)",
+            example: "$rose(" + m[1] + ") ends the wait",
+            apply: function(){ ambRewrite(req, new RegExp("until\\s+" + m[1] + "\\b", "i"), "until " + m[1] + " rises"); } },
+          { label: "While " + m[1] + " stays high (level)", note: "keeps the current form",
+            example: "wait ends when " + m[1] + " is high",
+            apply: function(){} }
+        ]});
+    }
+    // 2. $past(sig, N) with N > 1: reset-history assumption
+    m = core.match(/\$past\(\s*\w+\s*,\s*([2-9]\d*)\s*\)/);
+    if (m) {
+      out.push({ req: req, kind: "past",
+        title: "Requirement " + req.n + ": $past needs " + m[1] + " cycles of history",
+        body: "In the first " + m[1] + " cycles after reset, $past samples X and can fail even when the design is fine. " +
+          "The property assumes the scenario only matters once that history exists." +
+          "\n\nc0 c1 c2 c3 c4   (reset released at c1, N=3)" +
+          "\n X  X  X | ok  ok   <- $past(sig,3) sampled value",
+        options: [ { label: "Understood, keep it", apply: function(){} } ]});
+    }
+  });
+  // 3. "active" on a vector signal
+  (currentCtx ? currentCtx.signals : []).forEach(function(s){
+    if (!s.width) return;
+    (current || []).forEach(function(req){
+      if (new RegExp("\\b" + s.name + "\\b[^.]*\\bactive\\b", "i").test(req.sentence)) {
+        out.push({ req: req, kind: "active",
+          title: "Requirement " + req.n + ": \u201cactive\u201d on a vector",
+          body: s.name + " is " + s.width + ". The generated code reads \u201cactive\u201d as \u201cnot equal to zero\u201d.",
+          options: [ { label: "Understood, keep it", apply: function(){} } ]});
+      }
+    });
+  });
+  return out;
+}
+function ambRewrite(req, re, replacement) {
+  const spec = $("spec").value;
+  const idx = spec.indexOf(req.sentence);
+  if (idx < 0) return;
+  $("spec").value = spec.slice(0, idx) + req.sentence.replace(re, replacement) + spec.slice(idx + req.sentence.length);
+  doGenerate();
+}
+function ambRender() {
+  let box = $("ambiguity");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "ambiguity";
+    const cards = $("cards");
+    cards.parentNode.insertBefore(box, cards);
+  }
+  box.innerHTML = "";
+  const items = ambFind();
+  if (!items.length) return;
+  const head = document.createElement("p");
+  head.className = "hint";
+  head.innerHTML = "<b>Ambiguities to resolve</b> (" + items.length + "). Pick an interpretation; the spec rewrites and regenerates.";
+  box.appendChild(head);
+  items.forEach(function(it){
+    const div = document.createElement("div");
+    div.className = "acard";
+    const t = document.createElement("div");
+    t.innerHTML = "<b>" + it.title + "</b>";
+    div.appendChild(t);
+    const b = document.createElement("div");
+    b.style.whiteSpace = "pre-line"; b.style.margin = "6px 0";
+    b.textContent = it.body;
+    div.appendChild(b);
+    it.options.forEach(function(op){
+      const btn = document.createElement("button");
+      btn.className = "btn small";
+      btn.style.marginRight = "8px";
+      btn.textContent = op.label + (op.note ? " (" + op.note + ")" : "");
+      btn.title = op.example || "";
+      btn.onclick = function(){ op.apply(); ambRender(); };
+      div.appendChild(btn);
+    });
+    box.appendChild(div);
+  });
+}
+
 </script>
 </body>
 </html>
