@@ -516,6 +516,9 @@ function runGate(specText, uiClk, uiRst, uiRstLow) {
 /* ---------- text utilities ---------- */
 
 function splitSentences(text) {
+  // Preprocess: handle context headings and direction tags.
+  const pp = preprocessNested(text);
+  text = pp.text;
   const out = [];
   text.replace(/\r/g, "").split("\n").forEach(function(line){
     line = line.trim();
@@ -528,7 +531,67 @@ function splitSentences(text) {
     });
     if (buf.trim()) out.push(buf.trim());
   });
-  return out.filter(function(s){ return s.replace(/[^A-Za-z]/g, "").length > 3; }).slice(0, 12);
+  const result = out.filter(function(s){ return s.replace(/[^A-Za-z]/g, "").length > 3; }).slice(0, 12);
+  result.dirMap = pp.dirMap;
+  return result;
+}
+
+/* Nested specs: a line ending with ":" that starts with When/If/Whenever/Once/After
+   is a CONTEXT HEADING, not a requirement. Prepend its clause to following bullet
+   lines ("-", "*", "•", or letter/number bullets) until next heading or blank line.
+   Strips "(input)"/"(output)" direction tags, recording them in dirMap. */
+function preprocessNested(body) {
+  const dirMap = {};
+  const lines = body.replace(/\r/g, "").split("\n");
+  const out = [];
+  let heading = null;
+  lines.forEach(function(line){
+    let t = line.trim();
+    if (!t) { heading = null; return; }
+    // Strip direction tags, record direction.
+    // Parenthetical: "req (input)" ; Phrasal: "req is an input", "req is input"
+    t = t.replace(/(\w+)\s*\((input|output)\)/gi, function(m, sig, dir){
+      dirMap[sig.toLowerCase()] = dir.toLowerCase();
+      return sig;
+    });
+    t = t.replace(/(\w+)\s+is\s+an?\s+(input|output)\b/gi, function(m, sig, dir){
+      dirMap[sig.toLowerCase()] = dir.toLowerCase();
+      return m; // keep the phrase for the declaration detector; dir recorded
+    });
+    // Strip a leading list marker ("1.", "2)", "a.", "-", "*", "•") BEFORE
+    // classifying the line, so a numbered heading behaves like a bare heading.
+    const markerM = t.match(/^([-*•]|[a-z0-9]+[.)])\s+(.+)$/i);
+    const hadMarker = !!markerM;
+    // After stripping, a non-heading line must parse exactly as if it had no
+    // marker, so the "Once X is high it stays high until Y is high" rewrite to
+    // the "X stays high until Y is high" form applies here, to every line kind.
+    const stripped = (markerM ? markerM[2] : t)
+      .replace(/^(?:once|when|whenever|after)\s+(\w+)\s+is\s+(high|low)\b,?\s+it\s+stays\s+/i, "$1 stays ");
+    // Context heading: only a line ENDING IN ":" qualifies. A sentence that
+    // starts with Once/After/When but ends in "." is an ordinary requirement.
+    const hm = stripped.match(/^(when|if|whenever|once|after)\b(.+):$/i);
+    if (hm) {
+      heading = (hm[1] + hm[2]).trim();
+      return; // heading itself generates nothing
+    }
+    if (hadMarker) {
+      let bullet = stripped;
+      // "there after" / "thereafter" / "afterwards" at the end of a bullet is
+      // redundant with the heading's trigger; delete it before parsing.
+      bullet = bullet.replace(/\s+(there\s+after|thereafter|afterwards)\s*[.!?]?\s*$/i, "").trim();
+      // If the bullet has its own "after X" trigger, the heading does not apply.
+      if (heading && !/\bafter\b/i.test(bullet)) {
+        out.push(heading + ", " + bullet);
+      } else {
+        out.push(bullet);
+      }
+    } else {
+      // Non-bullet line: output as-is (already rewritten above), clear heading.
+      heading = null;
+      out.push(stripped);
+    }
+  });
+  return { text: out.join("\n"), dirMap: dirMap };
 }
 
 function baseName(sig) { return sig.replace(/\[.*/, ""); }
@@ -653,6 +716,30 @@ function drainLitWarnings(req) {
   }
 }
 
+// Width lookup for modulo arithmetic, refreshed on every buildRequirements call.
+let modWidths = {};
+const modNotes = [];
+function moduloIncr(sig, K, M) {
+  const w = modWidths[baseName(sig).toLowerCase()] || "";
+  const wm = w.match(/\[(\d+)\s*:\s*(\d+)\]/);
+  const W = wm ? Math.abs(+wm[1] - +wm[2]) + 1 : null;
+  if (W && M === Math.pow(2, W)) {
+    modNotes.push(" Modulo " + M + " equals 2^" + W + ", the declared width of " + sig +
+      ", so plain " + W + "-bit addition wraps naturally (15 -> 0). The sized constant " +
+      W + "'d" + K + " keeps the addition at " + W + " bits; an unsized 1 would widen the expression and reject the legal wraparound.");
+    return "(" + sig + " == $past(" + sig + ") + " + W + "'d" + K + ")";
+  }
+  modNotes.push(" Modulo " + M + (W ? " is not 2^" + W + " (" + sig + " is " + W + " bits)" : " (width of " + sig + " unknown)") +
+    ", so natural binary wraparound cannot be assumed. The explicit boundary conditional computes (past + " + K + ") mod " + M + " directly.");
+  return "(" + sig + " == (($past(" + sig + ") + " + K + " >= " + M + ") ? ($past(" + sig + ") + " + K + " - " + M + ") : ($past(" + sig + ") + " + K + ")))";
+}
+function drainModNotes(req) {
+  if (modNotes.length) {
+    req.levels.forEach(function(lv){ lv.note += modNotes.join(""); });
+    modNotes.length = 0;
+  }
+}
+
 function atomExpr(clause, known) {
   const sig = findSignalIn(clause, known);
   if (!sig) return null;
@@ -669,7 +756,9 @@ function atomExpr(clause, known) {
   else if (/\b(changes?|changed|toggles?|toggled)\b/.test(t)) e = "$changed(" + sig + ")";
   else if (/\bincrements?\b/.test(t)) {
     const im = t.match(/\bincrements?\s+by\s+(\d+)/);
-    e = "(" + sig + " == $past(" + sig + ") + " + (im ? im[1] : "1") + ")";
+    const K = im ? +im[1] : 1;
+    const mm = t.match(/\bmodulo\s+(\d+)/);
+    e = mm ? moduloIncr(sig, K, +mm[1]) : "(" + sig + " == $past(" + sig + ") + " + K + ")";
   }
   else if (/\bdecrements?\b/.test(t)) {
     const dm = t.match(/\bdecrements?\s+by\s+(\d+)/);
@@ -773,7 +862,7 @@ function extractTiming(lower) {
   if (m) return { op: "##" + m[1], words: m[1] + " cycles later" };
   if (/\bin the next cycle\b|\bnext cycle\b/.test(lower)) return { op: "|=>", words: "in the next cycle" };
   if (/\bin the same cycle\b|\bsame cycle\b/.test(lower)) return { op: "|->", words: "in the same cycle" };
-  if (/\beventually\b/.test(lower)) return { op: "s_eventually", words: "eventually" };
+  if (/\beventually\b/.test(lower) || /\bat\s+some\s+point\b/.test(lower)) return { op: "s_eventually", words: "eventually" };
   return null;
 }
 
@@ -797,13 +886,34 @@ function roleOf(sigName, ctx) {
   return null;
 }
 
-// A requirement that constrains testbench-driven inputs is an assumption;
-// one that checks DUT-guaranteed outputs is an assertion.
-function verbForClause(clause, ctx) {
-  const sigs = extractSignals(clause, ctx.signals.map(function(s){ return s.name; }));
+// Assertion vs assumption is chosen from the full requirement, not from the
+// consequent's signal direction alone. Default: checks on DUT behavior are
+// assertions. Only explicit "assume" intent or a purely testbench-driven
+// requirement becomes an assumption (a formal environment constraint).
+function verbFor(req, ctx) {
+  const sentence = req.sentence || "";
+  const names = ctx.signals.map(function(s){ return s.name; });
+  const sigs = extractSignals(sentence, names);
   const roles = sigs.map(function(s){ return roleOf(s, ctx); }).filter(Boolean);
-  if (roles.length > 0 && roles.every(function(r){ return r === "assume"; })) return { kw: "assume", pre: "am_" };
-  return { kw: "assert", pre: "a_" };
+  let kw, pre, why;
+  if (/\bassume\b/i.test(sentence) && !/\bassert\b/i.test(sentence)) {
+    kw = "assume"; pre = "am_";
+    why = " Role: assumption. The spec explicitly asks for assume, so this is a formal environment constraint.";
+  } else if (roles.some(function(r){ return r === "assert"; })) {
+    kw = "assert"; pre = "a_";
+    why = " Role: assertion. This checks DUT behavior, so it is an assertion even though part of it refers to a testbench-driven signal.";
+  } else if (roles.length > 0 && roles.every(function(r){ return r === "assume"; })) {
+    kw = "assume"; pre = "am_";
+    why = " Role: assumption. Every signal here is testbench-driven, so this constrains the stimulus (environment), not the DUT.";
+  } else {
+    kw = "assert"; pre = "a_";
+    why = " Role: assertion (default). DUT behavior checks default to assertions; nothing here marks this as an environment constraint.";
+  }
+  return { kw: kw, pre: pre, why: why };
+}
+
+function noteRole(req, V) {
+  req.levels.forEach(function(lv){ lv.note += V.why; });
 }
 
 function propLines(ctx, pname, core, vname, vkw) {
@@ -834,7 +944,7 @@ function parseResetValues(sentence, known) {
 
 /* a condition that must hold on every clock edge (positive invariant) */
 function buildHold(req, X, ctx, clause) {
-  const V = verbForClause(clause || "", ctx);
+  const V = verbFor(req, ctx);
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, X, req.sentence),
     "The simplest form. This condition must hold on every clock edge.");
@@ -844,21 +954,35 @@ function buildHold(req, X, ctx, clause) {
   addLevel(req, "Advanced", "a",
     propLines(ctx, "p_req" + req.n + "_adv", X, V.pre + "req" + req.n + "_adv", V.kw),
     "Same check in named form. No cover point is needed for a condition that must always hold.");
+  noteRole(req, V);
 }
 
 /* Duration words in the consequent: "for 3 cycles", "for at least 3 cycles",
    "for exactly 3 cycles". They are converted to repetition operators, never dropped. */
 function extractDuration(clause) {
-  let m = clause.match(/\bfor\s+at\s+least\s+(\d+)\s+cycles?\b/i);
+  // Ranges first: "for N to M cycles", "for N-M cycles", "between N and M cycles".
+  // These are consecutive-hold durations, never bounded delays. A bare "between
+  // N and M cycles" counts only with a stay/remain/hold/keep verb and never
+  // when followed by "later" (that is a genuine delay, e.g. "high between 2
+  // and 5 cycles later" -> ##[2:5]).
+  let m = clause.match(/\bfor\s+(\d+)\s+to\s+(\d+)\s+(?:consecutive\s+)?cycles?\b/i) ||
+          clause.match(/\bfor\s+(\d+)\s*-\s*(\d+)\s+(?:consecutive\s+)?cycles?\b/i) ||
+          clause.match(/\bfor\s+between\s+(\d+)\s+and\s+(\d+)\s+(?:consecutive\s+)?cycles?\b/i) ||
+          (/\b(stay|stays|remain|remains|hold|holds|keep|keeps)\b/i.test(clause)
+            ? clause.match(/\bbetween\s+(\d+)\s+and\s+(\d+)\s+(?:consecutive\s+)?cycles?\b(?!\s+later)/i)
+            : null);
+  if (m) return { n: +m[1], m: +m[2], kind: "range" };
+  m = clause.match(/\bfor\s+at\s+least\s+(\d+)\s+(?:consecutive\s+)?cycles?\b/i);
   if (m) return { n: +m[1], kind: "atLeast" };
-  m = clause.match(/\bfor\s+exactly\s+(\d+)\s+cycles?\b/i);
+  m = clause.match(/\bfor\s+exactly\s+(\d+)\s+(?:consecutive\s+)?cycles?\b/i);
   if (m) return { n: +m[1], kind: "exactly" };
-  m = clause.match(/\bfor\s+(\d+)\s+cycles?\b/i);
+  m = clause.match(/\bfor\s+(\d+)\s+(?:consecutive\s+)?cycles?\b/i);
   if (m) return { n: +m[1], kind: "for" };
   return null;
 }
 function applyDuration(C, dur) {
   if (!dur) return C;
+  if (dur.kind === "range") return "(" + C + ")[*" + dur.n + ":" + dur.m + "] ##1 (!(" + C + "))";
   if (dur.kind === "atLeast") return "(" + C + ")[*" + dur.n + ":$]";
   if (dur.kind === "exactly") return "(" + C + ")[*" + dur.n + "] ##1 (!(" + C + "))";
   return "(" + C + ")[*" + dur.n + "]";
@@ -892,18 +1016,28 @@ function registerPastHelper(n, ctx) {
 }
 
 function buildImplication(req, A, C, timing, ctx, conClause) {
-  const V = verbForClause(conClause || "", ctx);
+  const V = verbFor(req, ctx);
   // Duration words belong to the consequent; they are never dropped silently.
   const dur = extractDuration(conClause || "");
   const Cd = applyDuration(C, dur);
+  // A range duration ("for 1 to 3 cycles") is a consecutive hold, not a delay:
+  // extractTiming reads the same numbers as ##[N:M]; when the bounds match the
+  // duration, the delay reading is wrong and must be dropped.
+  if (dur && dur.kind === "range" && timing && timing.op === "##[" + dur.n + ":" + dur.m + "]") {
+    timing = null;
+  }
   let durNote = "";
   if (dur) {
-    if (dur.kind === "atLeast") durNote = " \"For at least " + dur.n + " cycles\" means " + dur.n + " or more consecutive cycles ([*" + dur.n + ":$]).";
+    if (dur.kind === "range") durNote = " \"For " + dur.n + " to " + dur.m + " cycles\" means between " + dur.n + " and " + dur.m + " consecutive cycles, followed by a cycle where the condition drops (termination check ##1 !(...)).";
+    else if (dur.kind === "atLeast") durNote = " \"For at least " + dur.n + " cycles\" means " + dur.n + " or more consecutive cycles ([*" + dur.n + ":$]).";
     else if (dur.kind === "exactly") durNote = " \"For exactly " + dur.n + " cycles\" means " + dur.n + " consecutive cycles followed by a cycle where the condition drops (termination check ##1 !(...)).";
     else durNote = " \"For " + dur.n + " cycles\" means " + dur.n + " consecutive cycles ([*" + dur.n + "]).";
     if (!timing) durNote += " The spec did not pin the start cycle, so the check starts in the same cycle as the trigger.";
   }
   const tNote = timing && timing.note ? " " + timing.note : "";
+  const evNote = (timing && timing.op === "s_eventually")
+    ? " s_eventually includes the trigger cycle itself: a same-cycle response satisfies the check."
+    : "";
   // $past history: gate on a generated history-valid helper, not a warning alone.
   const pastN = pastNeeded(A + " " + Cd);
   let Ag = A, histNote = "";
@@ -922,12 +1056,16 @@ function buildImplication(req, A, C, timing, ctx, conClause) {
   const retrig = /(\$rose|\$fell)/.test(A) ? "" : " A new check starts on every cycle the left side holds; overlapping checks are independent.";
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
-    "The simplest form. Whenever the left side holds, the right side must hold " + when + "." + retrig + durNote + tNote + histNote);
+    "The simplest form. Whenever the left side holds, the right side must hold " + when + "." + retrig + durNote + tNote + evNote + histNote);
   addLevel(req, "Intermediate", "i",
     propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
-    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench." + durNote + tNote + histNote);
+    "A named property with reset handled, so it never fires during reset. This is the form to check in to your testbench." + durNote + tNote + evNote + histNote);
   // Advanced: exactly one implication operator. The cause sequence carries the
   // trigger; a delay operator (if any) follows the single |-> / |=>.
+  // Tier equivalence: when $past needs the history guard, the gate goes INSIDE
+  // the cause sequence (a boolean && sequence is illegal; the gate must be part
+  // of the sequence itself).
+  const seqBody = pastN ? "(hist_valid_" + pastN + " && (" + A + "))" : A;
   let advCore, coverCore;
   if (timing && timing.op !== "|=>" && timing.op !== "s_eventually" && timing.op !== "|->") {
     advCore = "s_req" + req.n + "_cause |-> " + timing.op + " " + Cd;
@@ -943,16 +1081,18 @@ function buildImplication(req, A, C, timing, ctx, conClause) {
   const D = ctx.dis ? " " + ctx.dis : "";
   const seqPart = (timing && timing.op === "s_eventually")
     ? ""
-    : "sequence s_req" + req.n + "_cause;\n  " + A + ";\nendsequence\n";
+    : "sequence s_req" + req.n + "_cause;\n  " + seqBody + ";\nendsequence\n";
   addLevel(req, "Advanced", "a",
     seqPart + propLines(ctx, "p_req" + req.n + "_adv", advCore, V.pre + "req" + req.n + "_adv", V.kw) +
     "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " " + coverCore + ");",
-    "Sequence based form plus a cover point, so you also prove the scenario is reachable and not vacuous." + durNote + tNote + histNote);
+    "Sequence based form plus a cover point, so you also prove the scenario is reachable and not vacuous." + durNote + tNote + evNote + histNote);
   drainLitWarnings(req);
+  drainModNotes(req);
+  noteRole(req, V);
 }
 
 function buildInvariant(req, X, ctx, clause) {
-  const V = verbForClause(clause || "", ctx);
+  const V = verbFor(req, ctx);
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, "!(" + X + ")", req.sentence),
     "The simplest form. This condition must never be true on any clock edge.");
@@ -964,10 +1104,11 @@ function buildInvariant(req, X, ctx, clause) {
     "sequence s_req" + req.n + "_bad;\n  (" + X + ");\nendsequence\n" +
     propLines(ctx, "p_req" + req.n + "_adv", "not s_req" + req.n + "_bad", V.pre + "req" + req.n + "_adv", V.kw),
     "Sequence negation form. Reads as a forbidden scenario, which scales better when the condition grows.");
+  noteRole(req, V);
 }
 
 function buildMutex(req, gs, ctx) {
-  const V = verbForClause(gs.join(" "), ctx);
+  const V = verbFor(req, ctx);
   const list = gs.join(", ");
   const D = ctx.dis ? " " + ctx.dis : "";
   addLevel(req, "Beginner", "b",
@@ -981,6 +1122,7 @@ function buildMutex(req, gs, ctx) {
       propLines(ctx, "p_req" + req.n + "_adv", "$onehot(" + gs[0] + ")", V.pre + "req" + req.n + "_adv", V.kw) +
       "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $onehot(" + gs[0] + "));",
       "Exactly-one form, stronger than at most one, plus a cover point.");
+    noteRole(req, V);
     return;
   }
   const impl = gs.map(function(g){ return g + " |-> !(" + gs.filter(function(x){ return x !== g; }).join(" || ") + ")"; }).join(" &&\n    ");
@@ -988,23 +1130,80 @@ function buildMutex(req, gs, ctx) {
     propLines(ctx, "p_req" + req.n + "_adv", impl, V.pre + "req" + req.n + "_adv", V.kw) +
     "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $onehot({" + list + "}));",
     "Per signal implication form, which tells you exactly which signal broke the rule, plus a cover that each one is reachable.");
+  noteRole(req, V);
+}
+
+// Defect 7: every meaningful clause must be represented. After building, verify
+// that high-risk keywords in the sentence are reflected in the generated code.
+// If not, the requirement is skipped rather than partially translated.
+function unconsumedIssues(sentence, code) {
+  const t = " " + sentence.toLowerCase() + " ";
+  const issues = [];
+  if (/\bmodulo\s+\d+/.test(t) && !/(\?|%|\d+'[dhbo])/.test(code)) issues.push("modulo arithmetic");
+  const hasTimingBetween = /\bbetween\s+\d+\s+and\s+\d+\s+cycles/.test(t);
+  if (hasTimingBetween && !/##\[/.test(code) && !/\[\*\d+:\d+\]/.test(code)) issues.push("timing range");
+  // A range after a stay/remain/hold/keep verb is a consecutive-hold duration.
+  // If it was not represented as [*N:M], it must not fall through to a ##[N:M]
+  // delay reading; skip with the duration reason instead.
+  const durRange = t.match(/\bfor\s+(\d+)\s+(?:to|-)\s+(\d+)\s+(?:consecutive\s+)?cycles?\b/) ||
+    (/\b(stay|stays|remain|remains|hold|holds|keep|keeps)\b/.test(t) ? t.match(/\bbetween\s+(\d+)\s+and\s+(\d+)\s+cycles?\b/) : null);
+  if (durRange && !new RegExp("\\[\\*" + durRange[1] + ":" + durRange[2] + "\\]").test(code)) issues.push("duration");
+  if (/\bbetween\s+-?\d+\s+and\s+-?\d+/.test(t) && !hasTimingBetween && !/(>=|<=|>|<|inside)/.test(code)) issues.push("numeric range");
+  if (/\bunless\s+reset\b/.test(t) || /\bexcept\s+(?:if|on|when)\s+reset\b/.test(t)) issues.push("reset exception");
+  if (/\bunless\b/.test(t) && !/\buntil\b/.test(code)) issues.push("unless/until termination");
+  if (/\bfor\s+(?:at\s+least\s+|exactly\s+)?\d+\s+(?:consecutive\s+)?cycles?\b/.test(t) && !/\[\*/.test(code)) issues.push("duration");
+  if (/\b(remain\s+stable|stay\s+stable|must\s+not\s+change|does\s+not\s+change)\b/.test(t) && !/\$stable/.test(code)) issues.push("stability");
+  return issues;
+}
+
+function buildStallStability(req, condExpr, vSig, dataSigs, fullContract, termText, ctx) {
+  const V = verbFor(req, ctx);
+  const stabTerms = dataSigs.map(function(d){ return "$stable(" + d + ")"; }).join(" && ");
+  const rhs = fullContract ? "(" + vSig + " && " + stabTerms + ")" : (dataSigs.length > 1 ? "(" + stabTerms + ")" : stabTerms);
+  const core = "(" + condExpr + ") |=> " + rhs;
+  const clar =
+    " Stability is checked on every cycle where the stall condition holds; the cycle " + termText +
+    " becomes true is not covered (the antecedent is false there)." +
+    " This does not require " + termText + " to ever occur. If eventual handshake is required, say so explicitly." +
+    (fullContract
+      ? " Full stall contract: " + vSig + " persistence was included because the spec explicitly requires it."
+      : vSig
+        ? " Data-only requirement: " + vSig + " persistence was NOT added, because the spec only asks for data stability."
+        : " Data-only requirement: no signal persistence was added, because the spec only asks for data stability.");
+  addLevel(req, "Beginner", "b",
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
+    "The simplest form. Every stall cycle, the data must not change into the next cycle." + clar);
+  addLevel(req, "Intermediate", "i",
+    propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
+    "Named property with reset handled." + clar);
+  const seqPart = "sequence s_req" + req.n + "_stall;\n  " + condExpr + ";\nendsequence\n";
+  const D = ctx.dis ? " " + ctx.dis : "";
+  addLevel(req, "Advanced", "a",
+    seqPart + propLines(ctx, "p_req" + req.n + "_adv", "s_req" + req.n + "_stall |=> " + rhs, V.pre + "req" + req.n + "_adv", V.kw) +
+    "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " (" + condExpr + "));",
+    "Sequence based form plus a cover point proving the stall is reachable, so the check is not vacuous." + clar);
+  noteRole(req, V);
 }
 
 function buildStability(req, X, C, ctx) {
-  const V = verbForClause(X, ctx);
+  const V = verbFor(req, ctx);
+  // Guard with $past(C): $stable compares against the previous cycle, so on the
+  // first cycle C goes high there is no in-window previous value to compare to.
+  const guard = "(" + C + " && $past(" + C + "))";
   addLevel(req, "Beginner", "b",
-    oneLiner(ctx, V.pre + "req" + req.n, V.kw, "(" + C + ") |-> $stable(" + X + ")", req.sentence),
-    "The simplest form. While the condition holds, the signal must not change. This includes the cycle where the condition first goes high.");
+    oneLiner(ctx, V.pre + "req" + req.n, V.kw, guard + " |-> $stable(" + X + ")", req.sentence),
+    "The simplest form. While the condition holds, the signal must not change. $past(" + C + ") is in the antecedent because $stable compares against the previous cycle: on the first cycle the condition goes high there is no in-window previous value, so the check starts from the second cycle.");
   addLevel(req, "Intermediate", "i",
-    propLines(ctx, "p_req" + req.n, "(" + C + ") |-> $stable(" + X + ")", V.pre + "req" + req.n, V.kw),
+    propLines(ctx, "p_req" + req.n, guard + " |-> $stable(" + X + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
   addLevel(req, "Advanced", "a",
     propLines(ctx, "p_req" + req.n + "_adv", "$rose(" + C + ") |-> $stable(" + X + ") [*1:$] ##1 $fell(" + C + ")", V.pre + "req" + req.n + "_adv", V.kw),
     "Holds the signal stable across the entire window the condition is true, from rise to fall.");
+  noteRole(req, V);
 }
 
 function buildReset(req, vals, ctx) {
-  const V = verbForClause(vals.map(function(v){ return v.sig; }).join(" "), ctx);
+  const V = verbFor(req, ctx);
   const checks = vals.map(function(v){ return v.expr; }).join(" && ");
   const rstAsserted = ctx.activeLow ? "(!" + ctx.rst + ")" : ctx.rst;
   const rstDeasserted = ctx.activeLow ? ctx.rst : "(!" + ctx.rst + ")";
@@ -1029,10 +1228,12 @@ function buildReset(req, vals, ctx) {
     V.pre + "req" + req.n + "_adv : " + V.kw + " property (p_req" + req.n + "_adv);",
     "Also checks for X, so an uninitialized register cannot hide behind a reset value comparison.");
   drainLitWarnings(req);
+  drainModNotes(req);
+  noteRole(req, V);
 }
 
 function buildLiveness(req, E, ctx, clause) {
-  const V = verbForClause(clause || "", ctx);
+  const V = verbFor(req, ctx);
   const D = ctx.dis ? " " + ctx.dis : "";
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, "s_eventually (" + E + ")", req.sentence),
@@ -1044,10 +1245,11 @@ function buildLiveness(req, E, ctx, clause) {
     propLines(ctx, "p_req" + req.n + "_adv", "s_eventually (" + E + ")", V.pre + "req" + req.n + "_adv", V.kw) +
     "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " (" + E + "));",
     "Same check plus a cover point proving the awaited condition is reachable.");
+  noteRole(req, V);
 }
 
 function buildTimed(req, tp, ctx) {
-  const V = verbForClause(tp.kind === "followedBy" ? tp.Y : tp.X, ctx);
+  const V = verbFor(req, ctx);
   let core, desc;
   if (tp.kind === "minPulse") {
     core = "$rose(" + tp.X + ") |-> " + tp.X + "[*" + tp.n + "]";
@@ -1073,13 +1275,20 @@ function buildTimed(req, tp, ctx) {
     propLines(ctx, "p_req" + req.n + "_adv", core, V.pre + "req" + req.n + "_adv", V.kw) +
     "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $rose(" + tp.X + "));",
     "Same check plus a cover point, so you prove the trigger is reachable and the property is not vacuous.");
+  noteRole(req, V);
+}
+
+/* $rose() of a negated signal is $fell() of the signal. Never emit $rose(!x). */
+function roseOf(A) {
+  const m = String(A).trim().match(/^!\(?(\w+)\)?$/);
+  return m ? "$fell(" + m[1] + ")" : "$rose(" + A + ")";
 }
 
 function buildUntil(req, A, B, ctx, clause) {
-  const V = verbForClause(clause || "", ctx);
+  const V = verbFor(req, ctx);
   // Trigger on the rise of A: a bare "(A) until (B)" would fail on every
   // cycle where A is low, because weak until still requires A until B arrives.
-  const trig = "$rose(" + A + ")";
+  const trig = roseOf(A);
   addLevel(req, "Beginner", "b",
     oneLiner(ctx, V.pre + "req" + req.n, V.kw, trig + " |-> (" + A + ") until (" + B + ")", req.sentence),
     "The simplest form. When " + A + " rises, it must stay high on every cycle until " + B + " becomes true.");
@@ -1087,10 +1296,14 @@ function buildUntil(req, A, B, ctx, clause) {
     propLines(ctx, "p_req" + req.n, trig + " |-> (" + A + ") until (" + B + ")", V.pre + "req" + req.n, V.kw),
     "Named property with reset handled.");
   const D = ctx.dis ? " " + ctx.dis : "";
+  // Tier equivalence: Advanced keeps the SAME weak until as Intermediate. Strength
+  // (weak vs strong) comes from the spec, not the tier; making it strong "to be
+  // advanced" would change the requirement's meaning.
   addLevel(req, "Advanced", "a",
-    propLines(ctx, "p_req" + req.n + "_adv", trig + " |-> (" + A + ") s_until_with (" + B + ")", V.pre + "req" + req.n + "_adv", V.kw) +
+    propLines(ctx, "p_req" + req.n + "_adv", trig + " |-> (" + A + ") until (" + B + ")", V.pre + "req" + req.n + "_adv", V.kw) +
     "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " " + trig + ");",
-    "Strong until, which also requires " + B + " to actually arrive, plus a cover point on the trigger.");
+    "Same weak until as Intermediate (weak until does not require " + B + " to ever arrive), plus a cover point on the trigger. If the spec needs " + B + " to actually arrive, use s_until_with or add an eventual-arrival requirement.");
+  noteRole(req, V);
 }
 
 </script>
@@ -1149,9 +1362,9 @@ function exprEn(e) {
   if (m = e.match(/^\(?\s*(\w+)\s*==\s*\$past\(\1\)\s*-\s*1\s*\)?$/)) return m[1] + " decrements";
   if (m = e.match(/^\$past\((\w+),\s*(\d+)\)$/)) return "the value of " + m[1] + " " + m[2] + " cycles ago";
   if (m = e.match(/^\$past\((\w+)\)$/)) return "the previous value of " + m[1];
-  if (m = e.match(/^!\$isunknown\((\w+)\)$/)) return m[1] + " is not X";
-  if (m = e.match(/^\$onehot0\(\{\s*([\w\s,]+?)\s*\}\)$/)) return "at most one of " + m[1].trim().replace(/\s*,\s*/g, ", ") + " is high";
-  if (m = e.match(/^\$onehot\(\{\s*([\w\s,]+?)\s*\}\)$/)) return "exactly one of " + m[1].trim().replace(/\s*,\s*/g, ", ") + " is high";
+  if (m = e.match(/^!\$isunknown\((\w+)\)$/)) return m[1] + " is never X";
+  if (m = e.match(/^\$onehot0\(\{\s*([\w\s,]+?)\s*\}\)$/)) return "at most one of " + m[1].trim().replace(/\s*,\s*/g, ", ") + " is high at any time";
+  if (m = e.match(/^\$onehot\(\{\s*([\w\s,]+?)\s*\}\)$/)) return "exactly one of " + m[1].trim().replace(/\s*,\s*/g, ", ") + " is high at any time";
   if (m = e.match(/^\$onehot\((\w+)\)$/)) return m[1] + " is high";
   if (m = e.match(/^\(?\s*(\w+)\s*==\s*(0x[0-9a-fA-F]+|\d+)\s*\)?$/)) return m[1] + " equals " + m[2];
   if (m = e.match(/^not\s+(\w+)$/)) return "the " + m[1] + " scenario never happens";
@@ -1160,12 +1373,12 @@ function exprEn(e) {
   if ((m = e.match(/^([\s\S]*?)\s+s_until_with\s+([\s\S]*)$/))) {
     const a = exprEn(m[1]), b = exprEn(m[2]);
     if (a === null || b === null) return null;
-    return a.replace(/ is high$/, " holds") + " strongly until " + b;
+    return a.replace(/ is high$/, " stays high") + " until and including the cycle " + b;
   }
   if ((m = e.match(/^([\s\S]*?)\s+until\s+([\s\S]*)$/))) {
     const a = exprEn(m[1]), b = exprEn(m[2]);
     if (a === null || b === null) return null;
-    return a.replace(/ is high$/, " holds") + " until " + b;
+    return a.replace(/ is high$/, " stays high") + " until " + b + " (" + b.replace(/ is high$/, "") + " need not overlap)";
   }
   let parts = splitAllTop(e, "&&");
   if (parts.length > 1) {
@@ -1195,6 +1408,131 @@ function checksEn(s) {
     const e = exprEn(p);
     return e === null ? p : e;
   }).join(" and ");
+}
+
+/* AST walker: svaParse() output -> English. Used by the Explain tab.
+   Returns null if the construct is not understood. */
+function astEn(node) {
+  if (!node) return null;
+  const k = node.k;
+  // boolean / signal leaves
+  if (k === "sig") return node.sig + " is high";
+  if (k === "lit") return String(node.v);
+  if (k === "rose") return node.sig + " rises";
+  if (k === "fell") return node.sig + " falls";
+  if (k === "stable") return node.sig + " stays stable";
+  if (k === "past") return node.n === 1
+    ? node.sig + " was high in the previous cycle"
+    : node.sig + " was high " + node.n + " cycles ago";
+  if (k === "isunknown") return node.sig + " is X";
+  if (k === "onehot0") return "at most one of " + node.args.join(", ") + " is high at any time";
+  if (k === "onehot") return "exactly one of " + node.args.join(", ") + " is high at any time";
+  if (k === "not") {
+    const e = astEn(node.e);
+    if (e === null) return null;
+    // "not (sig is high)" -> "sig is low"; "not (sig is X)" -> "sig is never X"
+    const mh = e.match(/^(\w+) is high$/);
+    if (mh) return mh[1] + " is low";
+    const mx = e.match(/^(\w+) is X$/);
+    if (mx) return mx[1] + " is never X";
+    return "it is not the case that " + e;
+  }
+  if (k === "neg") { const e = astEn(node.e); return e === null ? null : "minus " + e; }
+  if (k === "and" || k === "or") {
+    const a = astEn(node.a), b = astEn(node.b);
+    return (a === null || b === null) ? null : a + (k === "and" ? " and " : " or ") + b;
+  }
+  if (k === "eq" || k === "ne" || k === "ge" || k === "le" || k === "gt" || k === "lt") {
+    // Increment/decrement pattern: cnt == $past(cnt) + 1
+    if (k === "eq" && node.a.k === "sig" && node.b.k === "arith" &&
+        node.b.a.k === "past" && node.b.a.sig === node.a.sig &&
+        node.b.b.k === "lit") {
+      const nn = node.b.b.v;
+      if (node.b.op === "+" && (nn === 1 || String(nn) === "1")) return node.a.sig + " increments";
+      if (node.b.op === "-" && (nn === 1 || String(nn) === "1")) return node.a.sig + " decrements";
+    }
+    const a = astEn(node.a), b = astEn(node.b);
+    if (a === null || b === null) return null;
+    const op = { eq: "equals", ne: "does not equal", ge: "is at least", le: "is at most", gt: "is greater than", lt: "is less than" }[k];
+    // "sig is high equals 5" is wrong; strip the "is high" for comparisons.
+    const sa = a.replace(/ is high$/, "");
+    return sa + " " + op + " " + b;
+  }
+  if (k === "arith") {
+    const a = astEn(node.a), b = astEn(node.b);
+    return (a === null || b === null) ? null : a.replace(/ is high$/, "") + " " + node.op + " " + b.replace(/ is high$/, "");
+  }
+  // sequences
+  if (k === "rep") { const b = astEn(node.base); return b === null ? null : b + " for " + node.n + " consecutive cycles"; }
+  if (k === "repRange") {
+    const b = astEn(node.base); if (b === null) return null;
+    const hi = node.m === Infinity ? "more" : "to " + node.m;
+    return b + " for " + node.n + " " + hi + " consecutive cycles";
+  }
+  if (k === "repGoto" || k === "repGotoExact") { const b = astEn(node.base); return b === null ? null : "the " + node.n + (node.n === 1 ? "st" : node.n === 2 ? "nd" : node.n === 3 ? "rd" : "th") + " occurrence of " + b; }
+  if (k === "repNonConsec") { const b = astEn(node.base); return b === null ? null : b + " occurs " + node.n + " times, not necessarily consecutively"; }
+  if (k === "seq") {
+    const parts = [];
+    const items = node.items;
+    let idx = 0;
+    if (items[0] !== null && !Array.isArray(items[0])) {
+      const b = astEn(items[0]); if (b === null) return null;
+      parts.push(b); idx = 1;
+    } else if (items[0] === null) { idx = 1; }
+    for (let j = idx; j < items.length; j++) {
+      const d = items[j][0], t = astEn(items[j][1]);
+      if (t === null) return null;
+      const ds = d[0] === d[1] ? (d[0] === 1 ? "in the next cycle" : d[0] + " cycles later")
+        : d[1] === Infinity ? d[0] + " or more cycles later"
+        : "within " + d[0] + " to " + d[1] + " cycles";
+      parts.push(ds + ", " + t);
+    }
+    return parts.join("; then ");
+  }
+  if (k === "throughout") {
+    const a = astEn(node.a), b = astEn(node.b);
+    return (a === null || b === null) ? null : a + " stays true for the whole time " + b + " is matching";
+  }
+  if (k === "intersect") {
+    const a = astEn(node.a), b = astEn(node.b);
+    return (a === null || b === null) ? null : "both sequences match, starting and ending together: (" + a + ") and (" + b + ")";
+  }
+  if (k === "first_match") { const e = astEn(node.e); return e === null ? null : "the first time " + e + " matches"; }
+  if (k === "nexttime") { const e = astEn(node.e); return e === null ? null : (node.n === 1 ? "in the next cycle" : node.n + " cycles later") + ", " + e; }
+  if (k === "always") { const e = astEn(node.e); return e === null ? null : e + " at any time"; }
+  if (k === "strong") { const e = astEn(node.e); return e === null ? null : e + " (strong: must complete)"; }
+  if (k === "weak") { const e = astEn(node.e); return e === null ? null : e + " (weak: may not complete)"; }
+  if (k === "eventually") { const b = astEn(node.b); return b === null ? null : b + " eventually happens"; }
+  if (k === "until") {
+    const a = astEn(node.a), b = astEn(node.b);
+    if (a === null || b === null) return null;
+    return a.replace(/ is high$/, " stays high") + " until " + b + " (" + b.replace(/ is high$/, "") + " need not overlap)";
+  }
+  if (k === "s_until_with") {
+    const a = astEn(node.a), b = astEn(node.b);
+    if (a === null || b === null) return null;
+    return a.replace(/ is high$/, " stays high") + " until and including the cycle " + b;
+  }
+  if (k === "impl") {
+    const a = astEn(node.a), b = astEn(node.b);
+    if (a === null || b === null) return null;
+    const ten = node.op === "|=>" ? "in the next cycle" : "";
+    // Suppress the tense only when the consequent carries its own timing
+    // (until, s_until_with, s_eventually, $past). Keep it for $stable/$changed.
+    const bk = node.b.k;
+    const suppress = bk === "until" || bk === "s_until_with" || bk === "eventually" || bk === "past";
+    return "when " + a + ", " + b + (suppress || !ten ? "" : " " + ten);
+  }
+  return null;
+}
+
+/* Honest message naming the unsupported construct. */
+function astUnsupported(node) {
+  const names = { intersect: "intersect", throughout: "throughout", first_match: "first_match",
+    repGotoExact: "[->N]", repNonConsec: "[=N]", repRange: "[*N:M]", nexttime: "nexttime",
+    strong: "strong", weak: "weak", always: "always" };
+  if (node && names[node.k]) return "The explainer does not yet understand `" + names[node.k] + "`.";
+  return null;
 }
 
 function coreBodyEn(c) {
@@ -1227,23 +1565,34 @@ function coreBodyEn(c) {
     if (tm) {
       if (tm[1].charAt(2) === "[") ten = "within " + tm[2] + " cycles";
       else if (tm[1] === "s_eventually") ten = "eventually";
-      else ten = tm[3] + " cycles later";
+      else ten = tm[3] === "1" ? "in the next cycle" : tm[3] + " cycles later";
       rest = tm[4];
     } else {
       ten = sp[2] === "|=>" ? "in the next cycle" : "in the same cycle";
     }
     const Ben = exprEn(rest);
     if (Aen === null || Ben === null) return null;
-    return "when " + Aen + ", " + Ben + " " + ten;
+    // If the consequent English already carries its own timing, do not append a tense.
+    if (/until|eventually|previous value|cycles ago|stays stable|never happens/.test(Ben)) ten = "";
+    // $past form: "B was high in the previous cycle", not "the previous value of B in the same cycle".
+    let BenFixed = Ben;
+    const pastM = rest.match(/^\$past\((\w+)\)$/);
+    if (pastM) BenFixed = pastM[1] + " was high in the previous cycle";
+    const pastNM = rest.match(/^\$past\((\w+),\s*(\d+)\)$/);
+    if (pastNM) BenFixed = pastNM[1] + " was high " + pastNM[2] + " cycles ago";
+    return "when " + Aen + ", " + BenFixed + (ten ? " " + ten : "");
   }
   // standalone eventually
   if ((m = c.match(/^s_eventually\s*\(([\s\S]+)\)$/))) {
     const e = exprEn(m[1]);
     return e === null ? null : e + " eventually happens";
   }
-  // bare boolean core
+  // bare boolean core: exactly one predicate. Never append "always holds" to a
+  // sentence that already contains a verb phrase.
   const e = exprEn(c);
-  return e === null ? null : e + " always holds";
+  if (e === null) return null;
+  if (/rises|falls|stays|never|eventually|until|at any time/.test(e)) return e;
+  return e + " always holds";
 }
 
 function coverEn(core) {
@@ -1265,6 +1614,29 @@ function looksLikeEnglish(src) {
   return !/(\|->|\|=>|\$|property|assert|assume|cover|&&|\|\||==|!|#)/.test(src);
 }
 
+/* Extract (label, verb, core, reset) from "label : assert property (@(clk) ...);".
+   Balances parentheses so nested parens in the core do not cut it short. */
+function extractAssert(src) {
+  const m = src.match(/^\s*(\w+)\s*:\s*(assert|assume|cover)\s+property\s*\(/i);
+  if (!m) return null;
+  let i = m[0].length;
+  let depth = 1;
+  const start = i;
+  while (i < src.length && depth > 0) {
+    if (src[i] === "(") depth++;
+    else if (src[i] === ")") depth--;
+    i++;
+  }
+  if (depth !== 0) return null;
+  let inner = src.slice(start, i - 1).trim();
+  // Strip leading clock and optional disable iff.
+  inner = inner.replace(/^\s*@\(\s*(?:posedge|negedge)\s+\w+(?:\s+or\s+(?:posedge|negedge)\s+\w+)?\s*\)\s*/, "");
+  let reset = false;
+  const dm = inner.match(/^\s*disable\s+iff\s*(\([^)]*\))\s*/i);
+  if (dm) { reset = true; inner = inner.slice(dm[0].length).trim(); }
+  return { label: m[1], verb: m[2].toLowerCase(), core: inner, reset: reset };
+}
+
 function explainSva(src) {
   const results = [];
   const rawText = String(src).replace(/\/\/[^\n]*/g, "");
@@ -1275,30 +1647,98 @@ function explainSva(src) {
   }
   let text = "\n" + rawText + "\n";
   const clockRe = "@\\(\\s*(?:posedge|negedge)\\s+\\w+(?:\\s+or\\s+(?:posedge|negedge)\\s+\\w+)?\\s*\\)";
+  // Declarations (int d; logic [7:0] x;) may appear between "property NAME;" and the clock.
+  const declRe = "(?:\\s*(?:int|logic|bit|byte|shortint|longint|integer)(?:\\s*\\[[^\\]]*\\])?\\s+\\w+\\s*(?:=\\s*[^;]+)?;)*";
+  // First pass: record all declared property names and whether their bodies use
+  // local-variable assignment (a single "=" that is not ==, !=, <=, >=).
+  const declaredProps = {};
+  const declScan = new RegExp("property\\s+(\\w+)\\s*;" + declRe + "\\s*" + clockRe +
+    "\\s*(?:disable\\s+iff\\s*\\([^;]*?\\))?\\s*([\\s\\S]*?);\\s*endproperty", "gi");
+  let dm;
+  while ((dm = declScan.exec(text)) !== null) {
+    const body = dm[2] || "";
+    // Single "=" not part of ==, !=, <=, >=, =>, |= indicates local-variable assignment.
+    const hasAssign = /(^|[^=!<>|])=(?![=>])/.test(body);
+    declaredProps[dm[1]] = hasAssign;
+  }
   const propRe = new RegExp(
-    "property\\s+(\\w+)\\s*;\\s*" + clockRe +
+    "property\\s+(\\w+)\\s*;" + declRe + "\\s*" + clockRe +
     "\\s*(disable\\s+iff\\s*\\([^;]*?\\))?\\s*([\\s\\S]*?);\\s*endproperty" +
     "\\s*(\\w+)\\s*:\\s*(assert|assume|cover)\\s+property\\s*\\(\\s*\\1\\s*\\)\\s*;",
     "gi");
   text = text.replace(propRe, function(m, pname, dis, core, vname, verb){
-    results.push({ label: vname + " : " + verb + " property (" + pname + ")", verb: verb, core: core.trim(), reset: !!dis });
+    results.push({ label: vname + " : " + verb + " property (" + pname + ")", verb: verb,
+      core: core.trim(), reset: !!dis, pname: pname, hasLocalVars: !!declaredProps[pname] });
     return "\n";
   });
-  const oneRe = new RegExp(
-    "(\\w+)\\s*:\\s*(assert|assume|cover)\\s+property\\s*\\((?:" + clockRe + "\\s*)?(disable\\s+iff\\s*\\([^)]*\\))?\\s*([\\s\\S]*?)\\)\\s*;",
-    "gi");
-  let m2;
-  while ((m2 = oneRe.exec(text)) !== null) {
-    results.push({ label: m2[1] + " : " + m2[2] + " property (...)", verb: m2[2], core: m2[4].trim(), reset: !!m2[3] });
+  // Labeled asserts: split into statements (respecting paren depth), then extract.
+  // This handles nested parens in the core, which a flat regex cannot.
+  const stmts = [];
+  let pdepth = 0, curSt = "";
+  for (let si = 0; si < text.length; si++) {
+    const ch = text[si];
+    if (ch === "(") pdepth++;
+    else if (ch === ")") pdepth--;
+    curSt += ch;
+    if (ch === ";" && pdepth === 0) { stmts.push(curSt); curSt = ""; }
+  }
+  if (curSt.trim()) stmts.push(curSt);
+  stmts.forEach(function(st){
+    const ex = extractAssert(st);
+    if (!ex) return;
+    const core2 = ex.core;
+    const bareProp2 = core2.match(/^(\w+)$/);
+    if (bareProp2 && declaredProps[bareProp2[1]] !== undefined) {
+      results.push({ label: ex.label + " : " + ex.verb + " property (" + bareProp2[1] + ")", verb: ex.verb,
+        core: core2, reset: ex.reset, pname: bareProp2[1], hasLocalVars: !!declaredProps[bareProp2[1]], isPropRef: true });
+    } else {
+      results.push({ label: ex.label + " : " + ex.verb + " property (...)", verb: ex.verb, core: core2, reset: ex.reset });
+    }
+  });
+  if (!results.length) {
+    // No label: "assert property (@(posedge clk) ...);" with optional trailing semicolon.
+    const noLabelRe = new RegExp(
+      "(assert|assume|cover)\\s+property\\s*\\((?:" + clockRe + "\\s*)?(disable\\s+iff\\s*\\([^)]*\\))?\\s*([\\s\\S]*?)\\)\\s*;?",
+      "gi");
+    let m3;
+    while ((m3 = noLabelRe.exec(text)) !== null) {
+      results.push({ label: "(" + m3[1] + " property)", verb: m3[1], core: m3[3].trim(), reset: !!m3[2] });
+    }
   }
   if (!results.length) {
     const t = String(src).replace(/\/\/[^\n]*/g, "").trim();
     if (t) results.push({ label: "(pasted code)", verb: "assert", core: t, reset: false });
   }
   results.forEach(function(r){
-    let body;
-    if (r.verb === "cover") body = coverEn(r.core);
-    else body = coreBodyEn(r.core);
+    // A bare property reference is never a signal; explain honestly.
+    if (r.isPropRef) {
+      if (r.hasLocalVars) {
+        r.english = "This assertion references property " + r.pname + ", which uses local variables; the explainer cannot describe it yet.";
+      } else {
+        r.english = "This assertion references property " + r.pname + ", whose body the explainer could not parse.";
+      }
+      return;
+    }
+    // Property with local variables: do not pretend to explain the body.
+    if (r.hasLocalVars) {
+      r.english = "This assertion references property " + r.pname + ", which uses local variables; the explainer cannot describe it yet.";
+      return;
+    }
+    let body = null;
+    // Try the SVA parser first; walk the AST for English.
+    // Fall back to the regex chain only if the parser throws.
+    let ast = null, parsed = false;
+    try { ast = svaParse(r.core); parsed = true; body = astEn(ast); }
+    catch (e) { parsed = false; }
+    if (body === null && parsed) {
+      const honest = astUnsupported(ast);
+      r.english = honest || "This one uses a form the explainer does not cover yet. It understands $rose, $fell, $stable, |->, |=>, ##N, until, and $onehot. Try: a1 : assert property (@(posedge clk) $rose(req) |-> ##[1:3] $rose(ack));";
+      return;
+    }
+    if (!parsed) {
+      if (r.verb === "cover") body = coverEn(r.core);
+      else body = coreBodyEn(r.core);
+    }
     if (body === null) {
       r.english = "This one uses a form the explainer does not cover yet. It understands $rose, $fell, $stable, |->, |=>, ##N, until, and $onehot. Try: a1 : assert property (@(posedge clk) $rose(req) |-> ##[1:3] $rose(ack));";
       return;
@@ -1309,6 +1749,208 @@ function explainSva(src) {
     if (r.reset && r.verb !== "cover") r.english += " It is not checked during reset.";
   });
   return results;
+}
+
+/* Hidden self-test: not wired to the UI. Run from console via runSelfTests().
+   Asserts the acceptance criteria; logs pass/fail counts. */
+function runSelfTests() {
+  let pass = 0, fail = 0;
+  const ok = function(name, cond, detail) {
+    if (cond) { pass++; }
+    else { fail++; console.log("FAIL: " + name + (detail ? " -- " + detail : "")); }
+  };
+  const mkGate = function(sigs) {
+    return { clkName: "clk", edge: "posedge", rstName: "rst_n", activeLow: true, sync: false,
+      signals: sigs.map(function(n){ return { name: n, width: "", role: null }; }), hdr: {} };
+  };
+  const coreOf = function(spec, sigs) {
+    const ctx = makeCtx(mkGate(sigs));
+    const r = buildRequirements(spec, ctx);
+    if (!r.reqs.length) return { skipped: true, reason: (r.skipped[0] || {}).reason || "" };
+    const code = r.reqs[0].levels[1].code; // Intermediate
+    const m = code.match(/disable iff[^\n]*\n([\s\S]*?)\nendproperty/);
+    const core = m ? m[1].trim().replace(/;$/, "") : code;
+    return { skipped: false, core: core };
+  };
+
+  // Spec -> SVA
+  let r = coreOf("ack must not be high unless req was high in the previous cycle.", ["ack", "req"]);
+  ok("A1 never-unless", !r.skipped && r.core === "ack |-> $past(req)", r.core);
+  r = coreOf("paddr must remain stable while psel is high.", ["paddr", "psel"]);
+  ok("A2 stable guard", !r.skipped && r.core === "(psel && $past(psel)) |-> $stable(paddr)", r.core);
+  r = coreOf("When req0 is high, gnt0 is eventually high.", ["req0", "gnt0"]);
+  ok("A3 eventually", !r.skipped && r.core === "req0 |-> s_eventually gnt0", r.core);
+  r = coreOf("When req rises, ack must rise within 3 cycles.", ["req", "ack"]);
+  ok("A3b unchanged", !r.skipped && r.core === "$rose(req) |-> ##[1:3] $rose(ack)", r.core);
+  r = coreOf("When valid is high and ready is low, valid stays high in the next cycle.", ["valid", "ready"]);
+  ok("tautology still skipped", r.skipped && /never fail/i.test(r.reason), r.reason);
+  r = coreOf("When reqq rises, ack must rise within 2 cycles.", ["req", "ack"]);
+  ok("typo still skipped", r.skipped && /Did you mean 'req'/.test(r.reason), r.reason);
+
+  // Playground
+  const tr = function(req, ack) { return { req: req.split("").map(Number), ack: ack.split("").map(Number) }; };
+  let pc = svaCheck("$rose(req) |-> ##[1:$] ack", tr("01000000", "00000100"), 8, null);
+  ok("A4 unbounded pass", pc.verdict === "PASS", pc.verdict);
+  pc = svaCheck("$rose(req) |-> ##[1:$] ack", tr("01000000", "00000000"), 8, null);
+  ok("A4 unbounded pending", pc.verdict === "PENDING", pc.verdict);
+  pc = svaCheck("req |-> ##1 (ack[*1:3] ##1 done)",
+    { req: "01000000".split("").map(Number), ack: "00110000".split("").map(Number), done: "00001000".split("").map(Number) }, 8, null);
+  ok("A4 chained rep", pc.verdict === "PASS", pc.verdict);
+  pc = svaCheck("$rose(req) |-> ack[->1] ##1 !req",
+    { req: "01110000".split("").map(Number), ack: "00010000".split("").map(Number) }, 8, null);
+  ok("A4 goto", pc.verdict === "PASS", pc.verdict);
+
+  // Explain
+  let ex = explainSva("property p_data; int d; @(posedge clk) (valid, d = data_in) |-> ##3 (data_out == d); endproperty\na23 : assert property (p_data);");
+  ok("A5 local vars", ex.length && /p_data/.test(ex[0].english) && /local variables/.test(ex[0].english) && !/p_data is high/.test(ex[0].english), ex[0] && ex[0].english);
+  ex = explainSva("a : assert property (@(posedge clk) gnt0 |-> $past(req0));");
+  ok("A6 past tense", ex.length && /req0 was high in the previous cycle/.test(ex[0].english), ex[0] && ex[0].english);
+  ex = explainSva("a : assert property (@(posedge clk) $rose(irq) |-> irq[*2:$]);");
+  ok("B repGoto explained", ex.length && !/does not cover yet/.test(ex[0].english), ex[0] && ex[0].english);
+  ex = explainSva("a : assert property (@(posedge clk) en |=> (cnt == $past(cnt) + 4'd1));");
+  ok("B increment", ex.length && /increments/.test(ex[0].english), ex[0] && ex[0].english);
+  ex = explainSva("assert property (@(posedge clk) req |-> ##1 ack);");
+  ok("B no label", ex.length && !/does not cover yet/.test(ex[0].english), ex[0] && ex[0].english);
+  ex = explainSva("a : assert property (@(posedge clk) req |-> ##1 ack)");
+  ok("B no semicolon", ex.length && !/does not cover yet/.test(ex[0].english), ex[0] && ex[0].english);
+  ex = explainSva("a : assert property (@(posedge clk) (a ##1 b) intersect (c ##2 d));");
+  ok("B intersect", ex.length && (/intersect/.test(ex[0].english) || !/does not cover yet/.test(ex[0].english)), ex[0] && ex[0].english);
+
+  // Fix 1: |=> not treated as local-variable assignment
+  ex = explainSva("property p1; @(posedge clk) clr |=> !irq; endproperty\na1 : assert property (p1);");
+  ok("F1 imply-not-assign", ex.length && /when clr is high, irq is low in the next cycle/.test(ex[0].english) && !/local variables/.test(ex[0].english), ex[0] && ex[0].english);
+  // Fix 2: $isunknown forms
+  ex = explainSva("a : assert property (@(posedge clk) !$isunknown(data_in));");
+  ok("F2 never-X", ex.length && /data_in is never X/.test(ex[0].english), ex[0] && ex[0].english);
+  // Fix 3: tense kept for $stable consequent
+  ex = explainSva("a : assert property (@(posedge clk) (valid && !ready) |=> $stable(data));");
+  ok("F3 stable-tense", ex.length && /data stays stable in the next cycle/.test(ex[0].english), ex[0] && ex[0].english);
+  // Fix 4: svaCheck try/catch is UI-side; verify the error detail format via a direct throw
+  let threw = false;
+  try { svaParse("a |-> b ##"); } catch (e) { threw = true; }
+  ok("F4 parse-throws", threw, "");
+
+  // Nested specs with context headings
+  const nestedSpec = "When req rises:\n- req must remain high until ack rises\n- ack must fall in the next cycle after req falls\nWhen ack rises:\n- req must fall within 2 cycles\nreset (rst_n) is an input, active low; req is an input, ack is an output.";
+  const ngate = { clkName: "clk", edge: "posedge", rstName: "rst_n", activeLow: true, sync: false,
+    signals: ["req", "ack"].map(function(n){ return { name: n, width: "", role: null }; }), hdr: {} };
+  const nctx = makeCtx(ngate);
+  const nr = buildRequirements(nestedSpec, nctx);
+  const cores = nr.reqs.map(function(q){
+    const code = q.levels[1].code;
+    const m = code.match(/disable iff[^\n]*\n([\s\S]*?)\nendproperty/);
+    return m ? m[1].trim().replace(/;$/, "") : "";
+  });
+  // Normalize: allow optional parens around until operands.
+  const norm = function(c){
+    return c.replace(/\$rose\(req\) \|-> \(?req\)? until \(?\$rose\(ack\)\)?/, "$rose(req) |-> req until $rose(ack)");
+  };
+  const ncores = cores.map(norm);
+  ok("N1 until", ncores.some(function(c){ return c === "$rose(req) |-> req until $rose(ack)"; }), cores.join(" | "));
+  ok("N2 fell", ncores.some(function(c){ return c === "$fell(req) |=> $fell(ack)"; }), cores.join(" | "));
+  ok("N3 within", cores.some(function(c){ return c === "$rose(ack) |-> ##[1:2] $fell(req)"; }), cores.join(" | "));
+  // No bare edge cores
+  const bareEdge = cores.filter(function(c){ return /^\$(rose|fell|stable|changed)\(\w+\)$/.test(c); });
+  ok("N4 no bare edge", bareEdge.length === 0, bareEdge.join(", "));
+  // No reset-value assertions from the declaration line
+  const rstVals = nr.reqs.filter(function(q){ return q.kind === "reset"; });
+  ok("N5 no reset vals", rstVals.length === 0, rstVals.length + " reset reqs");
+  // Direction recorded
+  const reqSig = nctx.signals.filter(function(s){ return s.name === "req"; })[0];
+  const ackSig = nctx.signals.filter(function(s){ return s.name === "ack"; })[0];
+  ok("N6 directions", reqSig && reqSig.dir === "input" && ackSig && ackSig.dir === "output",
+    JSON.stringify(nctx.signals.map(function(s){ return s.name + ":" + s.dir; })));
+
+  // Numbered headings, "there after", multi-sentence bullet
+  const nested2 = "1. When req (input) rises:\n- req must remain high until ack (output) rises\n2. When ack rises:\n- req must fall within 2 cycles there after\n3. When req falls:\n- ack (output) must fall in the next cycle. req is zero when ack falls";
+  const nctx2 = makeCtx(ngate);
+  const nr2 = buildRequirements(nested2, nctx2);
+  const cores2 = nr2.reqs.map(function(q){
+    const code = q.levels[1].code;
+    const m = code.match(/disable iff[^\n]*\n([\s\S]*?)\nendproperty/);
+    return m ? m[1].trim().replace(/;$/, "") : "";
+  });
+  ok("H1 numbered until", cores2.indexOf("$rose(req) |-> (req) until ($rose(ack))") !== -1, cores2.join(" | "));
+  ok("H2 thereafter", cores2.indexOf("$rose(ack) |-> ##[1:2] $fell(req)") !== -1, cores2.join(" | "));
+  ok("H3 fell next", cores2.indexOf("$fell(req) |=> $fell(ack)") !== -1, cores2.join(" | "));
+  ok("H4 zero-when", cores2.indexOf("$fell(ack) |-> (req == 0)") !== -1, cores2.join(" | "));
+  const trigSkips = nr2.skipped.filter(function(sk){ return /names a trigger/.test(sk.reason); });
+  ok("H5 no trigger skips", trigSkips.length === 0, trigSkips.map(function(sk){ return sk.reason; }).join("; "));
+
+  // APB regression: "Once X is high it stays high until Y is high" is a
+  // requirement (ends in "."), not a heading.
+  const apbGate = { clkName: "clk", edge: "posedge", rstName: "rst_n", activeLow: true, sync: false,
+    signals: ["penable", "pready"].map(function(n){ return { name: n, width: "", role: null }; }), hdr: {} };
+  const apbCtx = makeCtx(apbGate);
+  const apbR = buildRequirements("Once penable is high it stays high until pready is high.", apbCtx);
+  const apbCores = apbR.reqs.map(function(q){
+    const code = q.levels[1].code;
+    const m = code.match(/disable iff[^\n]*\n([\s\S]*?)\nendproperty/);
+    return m ? m[1].trim().replace(/;$/, "") : "";
+  });
+  ok("H6 once-stays-until", apbCores.indexOf("$rose(penable) |-> (penable) until (pready)") !== -1, apbCores.join(" | "));
+
+  // Duration ranges: consecutive hold, never a ##[N:M] delay
+  const reqGate = { clkName: "clk", edge: "posedge", rstName: "rst_n", activeLow: true, sync: false,
+    signals: [{ name: "req", width: "", role: null }], hdr: {} };
+  const durCore = function(spec, g){
+    const r = buildRequirements(spec, makeCtx(g));
+    if (!r.reqs.length) return null;
+    const code = r.reqs[0].levels[1].code;
+    const m = code.match(/disable iff[^\n]*\n([\s\S]*?)\nendproperty/);
+    return m ? m[1].trim().replace(/;$/, "") : "";
+  };
+  ok("D1 range hold", durCore("When req rises, req must stay high for 1 to 3 cycles.", reqGate) === "$rose(req) |-> (req)[*1:3] ##1 (!(req))",
+    durCore("When req rises, req must stay high for 1 to 3 cycles.", reqGate) || "none");
+  ok("D2 at least", (durCore("When req rises, req stays high for at least 2 cycles.", reqGate) || "").indexOf("(req)[*2:$]") !== -1,
+    durCore("When req rises, req stays high for at least 2 cycles.", reqGate) || "none");
+  ok("D3 exactly", (durCore("When req rises, req must stay high for exactly 3 cycles.", reqGate) || "").indexOf("(req)[*3] ##1 (!(req))") !== -1,
+    durCore("When req rises, req must stay high for exactly 3 cycles.", reqGate) || "none");
+
+  // List markers on Once/After sentences parse identically to no marker
+  ok("M1 numbered once", durCore("2. Once penable is high it stays high until pready is high.", apbGate) === "$rose(penable) |-> (penable) until (pready)",
+    durCore("2. Once penable is high it stays high until pready is high.", apbGate) || "none");
+  ok("M2 dashed once", durCore("- Once penable is high it stays high until pready is high.", apbGate) === "$rose(penable) |-> (penable) until (pready)",
+    durCore("- Once penable is high it stays high until pready is high.", apbGate) || "none");
+
+  // Ben's full spec: numbered headings, dir tags, "there after", duration range
+  const benSpec = "1. When req (input) rises:\n- req must stay high for 1 to 3 cycles\n- req must remain high until ack (output) rises\n2. When ack rises:\n- req must fall within 2 cycles there after\n3. When req falls:\n- ack (output) must fall in the next cycle. req is zero when ack falls\nreset (rst_n) is an input, active low; req is an input, ack is an output.";
+  const benCtx = makeCtx(ngate);
+  const benR = buildRequirements(benSpec, benCtx);
+  ok("M3 ben count", benR.reqs.length === 5 && benR.skipped.length === 0,
+    benR.reqs.length + " generated, " + benR.skipped.length + " skipped: " +
+    benR.skipped.map(function(sk){ return sk.reason; }).join("; "));
+  const benCore1 = benR.reqs.length ? (function(){
+    const code = benR.reqs[0].levels[1].code;
+    const m = code.match(/disable iff[^\n]*\n([\s\S]*?)\nendproperty/);
+    return m ? m[1].trim() : "";
+  })() : "";
+  ok("M4 ben range core", benCore1.indexOf("[*1:3]") !== -1 && benCore1.indexOf("##[1:3]") === -1, benCore1);
+
+  // Round-trip: sample specs must all be explainable.
+  ["fifo", "apb", "arbiter"].forEach(function(key){
+    const spec = EXAMPLES[key].spec;
+    const sigs = EXAMPLES[key].signals.split("\n").map(function(s){ return s.trim(); }).filter(Boolean);
+    const hdr = parseSpecHeader(spec) || {};
+    const hdrSigs = (hdr.signals && hdr.signals.length ? hdr.signals : sigs).map(function(n){
+      return typeof n === "string" ? { name: n, width: "", role: null } : n; });
+    const gate2 = { clkName: hdr.clock ? hdr.clock.name : "clk", edge: "posedge",
+      rstName: hdr.reset ? hdr.reset.name : "rst_n", activeLow: !(hdr.reset && hdr.reset.activeHigh),
+      sync: !!(hdr.reset && hdr.reset.sync),
+      signals: hdrSigs, hdr: hdr };
+    const ctx2 = makeCtx(gate2);
+    const body = spec.split(/Requirements[\s\S]*?:/)[1] || spec;
+    const rr = buildRequirements(body, ctx2);
+    rr.reqs.forEach(function(q){
+      const ic = q.levels[1].code;
+      const exx = explainSva(ic);
+      const bad = exx.some(function(e){ return /does not cover yet/.test(e.english); });
+      ok("round-trip " + key + " req" + q.n, !bad, bad ? exx[0].english : "");
+    });
+  });
+
+  console.log("runSelfTests: " + pass + " passed, " + fail + " failed");
+  return { pass: pass, fail: fail };
 }
 
 /* ---------- waveform (WaveDrom JSON) to requirements ---------- */
@@ -1419,18 +2061,71 @@ function isTautology(A, C) {
 function buildRequirements(body, ctx) {
   const known = ctx.signals.map(function(s){ return s.name; });
   const sentences = splitSentences(body);
+  // Apply direction tags from "(input)"/"(output)" to signal declarations.
+  if (sentences.dirMap) {
+    ctx.signals.forEach(function(sg){
+      const d = sentences.dirMap[baseName(sg.name).toLowerCase()];
+      if (d) sg.dir = d;
+    });
+  }
   const reqs = [];
   const skipped = [];
   pastHelpers = {};
+  modWidths = {};
+  ctx.signals.forEach(function(sg){ modWidths[baseName(sg.name).toLowerCase()] = sg.width || ""; });
   sentences.forEach(function(s, idx){
     const n = idx + 1;
     litWarnings.length = 0;
+    modNotes.length = 0;
+    // "unless reset ..." / "except if reset ..." is an exception that cancels the obligation, not a trigger.
+    // The existing disable iff already implements it, so strip it before the generic
+    // unless->until rewrite can turn it into a reset-triggered requirement.
+    let resetExc = null;
+    const urm = s.match(/\b(?:unless|except\s+(?:if|on|when))\s+reset(?:\s+(?:occurs|asserts|is\s+asserted|happens))?[^.!?]*\.?/i);
+    if (urm) {
+      resetExc = urm[0].replace(/[.!?]\s*$/, "").trim();
+      s = s.replace(urm[0], " ").replace(/\s+/g, " ").replace(/\s+([.,!?])/g, "$1").trim();
+      if (!/[.!?]$/.test(s)) s += ".";
+    }
+    const noteResetExc = function(req) {
+      if (resetExc) req.levels.forEach(function(lv){
+        lv.note += " Reset exception: \"" + resetExc + "\" is handled by the existing disable iff, which cancels any in-flight obligation when reset asserts. It was parsed as an exception, not as a reset-triggered requirement.";
+      });
+    };
+    // Defect 7: skip (don't partially translate) when meaningful clauses are unconsumed.
+    const checkUnconsumed = function(req) {
+      const code = req.levels.length > 1 ? req.levels[1].code : req.levels[0].code;
+      const issues = unconsumedIssues(s, code);
+      if (issues.length) {
+        skipped.push({ n: n, sentence: s,
+          reason: "The requirement mentions " + issues.join(", ") + ", but the generated assertion does not represent it. It was skipped rather than partially translated. Rephrase with explicit timing or split it into separate requirements." });
+        return false;
+      }
+      return true;
+    };
+    // "X must never/not be P unless Y" means "X being P implies Y". Rewrite as an
+    // implication before the generic unless->until can mangle it.
+    // e.g. "ack must never be high unless req was high" -> "When ack is high, req was high."
+    // e.g. "ack must not be high unless req was high" -> "When ack is high, req was high."
+    const nuM = s.match(/^\s*(.+?)\s+(must\s+never|must\s+not|may\s+not|cannot|can\'t|should\s+not)\s+(?:be\s+)?(.+?)\s+unless\s+(.+?)[.!?]?\s*$/i);
+    if (nuM && !/\breset\b/i.test(nuM[4])) {
+      s = "When " + nuM[1].trim() + " is " + nuM[3].trim() + ", " + nuM[4].trim() + ".";
+    }
     // "A unless B" reads as "A until B"
     if (/\bunless\b/i.test(s) && !/^\s*(if|when|whenever|once)\b/i.test(s)) {
       s = s.replace(/\bunless\b/gi, "until");
     }
+    // "X must follow Y within N cycles" -> "When Y rises, X within N cycles"
+    s = s.replace(/^\s*(.+?)\s+must\s+follow\s+(.+?)\s+within\s+(\d+)\s+cycles?\s*[.!?]?\s*$/i, "When $2 rises, $1 within $3 cycles.");
     // "X no later than N cycles after Y" -> "When Y, X within N cycles"
     s = s.replace(/^\s*(.+?)\s+no\s+later\s+than\s+(\d+)\s+cycles?\s+after\s+(.+?)\s*[.!?]?\s*$/i, "When $3, $1 within $2 cycles.");
+    // "X within N cycles after Y rises" -> "When Y rises, X within N cycles"
+    s = s.replace(/^\s*(.+?)\s+within\s+(\d+)\s+cycles?\s+after\s+(.+?)\s+rises?\s*[.!?]?\s*$/i, "When $3 rises, $1 within $2 cycles.");
+    // "X after Y falls/rises" -> "When Y falls/rises, X" (the "after" clause is the trigger).
+    // Exclude "must remain/stay stable after" which has its own handler below.
+    if (!/must\s+(?:remain|stay)\s+stable\s+after/i.test(s)) {
+      s = s.replace(/^\s*(.+?)\s+after\s+(.+?)\s+(falls?|rises?|fell|rose)\s*[.!?]?\s*$/i, "When $2 $3, $1.");
+    }
     const t = " " + s.toLowerCase() + " ";
     const sigs = extractSignals(s, known);
 
@@ -1440,12 +2135,29 @@ function buildRequirements(body, ctx) {
         reason: "This requirement spans clock domains. Clock-domain crossing needs dedicated CDC methodology (synchronizer chains, handshake protocols), which this tool does not generate. It was skipped rather than guessed." });
       return;
     }
+    // bookkeeping / scoreboard: "each response belongs to one request" needs an
+    // outstanding-transaction count, which a single assertion cannot express.
+    if (/\b(each|every)\b[^.!?]*\b(must|should)\b[^.!?]*\b(correspond|belong|match)(ing)?\b/i.test(t) ||
+        /\b(must|should)\b[^.!?]*\bhave\s+a\s+matching\b/i.test(t)) {
+      skipped.push({ n: n, sentence: s,
+        reason: "This asks that each response be paired with its own request (\"each response belongs to one request\"), which needs bookkeeping of outstanding transactions, a scoreboard or a counter, not a single assertion. It was skipped rather than guessed. If you mean \"each request gets a response\", rephrase as e.g. 'When req rises, ack rises within 3 cycles.'" });
+      return;
+    }
     // "X updates": checking that a signal carries the right updated value needs
     // a reference model or scoreboard. $changed would invent "value must change"
     // semantics: a valid read may return the same value as the previous read.
     if (/\bupdates?\b|\bupdated\b/i.test(t)) {
       skipped.push({ n: n, sentence: s,
         reason: "Checking that a signal carries the correct updated value needs a reference model or scoreboard. A $changed check would pass or fail on data coincidence, not correctness, so nothing was generated." });
+      return;
+    }
+
+    // Declaration sentence: describes signals/reset direction or attributes
+    // ("reset (rst_n) is an input, active low; req is an input, ack is an output.").
+    // This is header information, not a requirement. Consume it silently: do NOT
+    // turn it into a reset-value assertion. Only "After reset, X is 0" style
+    // sentences produce reset-value checks.
+    if (/\b(input|output)\b/i.test(t) && /\b(is\s+an?\s+(input|output)|,\s*(input|output)\b|active\s+(low|high)\b)/i.test(t)) {
       return;
     }
 
@@ -1482,13 +2194,37 @@ function buildRequirements(body, ctx) {
         return;
       }
     }
+    // backpressure data stability: "When <stall cond>, <data> must remain stable until <term>."
+    // Per-cycle check: cond |=> $stable(data). VALID persistence is added ONLY when
+    // the spec explicitly requires valid to persist (the full stall contract).
+    // This branch runs before the generic until path, which drops the stability term.
+    let bpm = s.match(/^\s*(?:when|if|whenever)\s+(.+?),\s*(.+?)\s+must\s+(?:remain|stay)\s+stable\s+until\s+(.+?)[.!?]?\s*$/i);
+    if (bpm) {
+      const condExpr = clauseToExpr(bpm[1], known);
+      const subjSigs = extractSignals(bpm[2], known);
+      const vMatch = bpm[1].match(/([A-Za-z_]\w*)\s+(?:is\s+)?high/i);
+      const vSig = vMatch ? findSignalIn(vMatch[1], known) : null;
+      const dataSigs = vSig ? subjSigs.filter(function(x){ return x.toLowerCase() !== vSig.toLowerCase(); }) : subjSigs.slice();
+      const fullContract = !!(vSig && subjSigs.some(function(x){ return x.toLowerCase() === vSig.toLowerCase(); }));
+      if (condExpr && subjSigs.length > 0 && dataSigs.length > 0) {
+        const req = mkReq(n, s, "stall-stability",
+          (fullContract ? "Full stall contract: " : "Data-only stability: ") +
+          dataSigs.join(", ") + " must not change on any cycle where " + bpm[1].trim() + ".");
+        buildStallStability(req, condExpr, vSig, dataSigs, fullContract, bpm[3].trim(), ctx);
+        reqs.push(req);
+        return;
+      }
+    }
     // until
+    // "A until B" (without a When/If trigger; those go to the implication branch
+    // below, which handles "When X, Y until Z" correctly).
     let m = s.match(/^(.+?)\s+until\s+(.+?)[.!?]?\s*$/i);
-    if (m) {
+    if (m && !/^\s*(when|if|whenever|once)\b/i.test(s)) {
       const A = clauseToExpr(m[1], known), B = clauseToExpr(m[2], known);
       if (A && B) {
         const req = mkReq(n, s, "until", m[1].trim() + " must hold on every cycle until " + m[2].trim() + ".");
         buildUntil(req, A, B, ctx, m[2]);
+        if (!checkUnconsumed(req)) return;
         reqs.push(req);
         return;
       }
@@ -1504,6 +2240,58 @@ function buildRequirements(body, ctx) {
         return;
       }
       if (A && C) {
+        // "X is eventually <level>" / "X eventually becomes <level>" is liveness,
+        // not a symbolic value. Route to the s_eventually path before the
+        // symbolic-value check can misfire on the word "eventually".
+        const evM = m[3].match(/^\s*(.+?)\s+(?:is\s+eventually|eventually\s+(?:is|becomes?))\s+(high|low|asserted|deasserted|1|0)\b/i);
+        if (evM) {
+          const evSig = findSignalIn(evM[1], known);
+          if (evSig) {
+            const evE = /^(low|deasserted|0)$/i.test(evM[2]) ? "(!" + evSig + ")" : evSig;
+            const req = mkReq(n, s, "implication",
+              "If " + m[2].trim() + ", then " + evM[1].trim() + " is eventually " + evM[2] + " (eventually).");
+            buildImplication(req, A, evE, { op: "s_eventually", words: "eventually",
+              note: "" }, ctx, m[3]);
+            if (!checkUnconsumed(req)) return;
+            noteResetExc(req);
+            reqs.push(req);
+            return;
+          }
+        }
+        // "When X, Y until Z": consequent is an until. Build A |-> (Y until Z).
+        const untM = m[3].match(/^(.+?)\s+until\s+(.+?)$/i);
+        if (untM) {
+          const uA = clauseToExpr(untM[1], known), uB = clauseToExpr(untM[2], known);
+          if (uA && uB) {
+            const req = mkReq(n, s, "implication",
+              "If " + m[2].trim() + ", then " + untM[1].trim() + " until " + untM[2].trim() + ".");
+            const V = verbFor(req, ctx);
+            const core = A + " |-> (" + uA + ") until (" + uB + ")";
+            const D = ctx.dis ? " " + ctx.dis : "";
+            addLevel(req, "Beginner", "b", oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
+              "The simplest form. When " + m[2].trim() + ", " + untM[1].trim() + " holds until " + untM[2].trim() + ".");
+            addLevel(req, "Intermediate", "i", propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
+              "Named property with reset handled.");
+            addLevel(req, "Advanced", "a",
+              propLines(ctx, "p_req" + req.n + "_adv", core, V.pre + "req" + req.n + "_adv", V.kw) +
+              "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " " + A + ");",
+              "Same check plus a cover point on the trigger.");
+            noteRole(req, V);
+            if (!checkUnconsumed(req)) return;
+            noteResetExc(req);
+            reqs.push(req);
+            return;
+          }
+        }
+        // "is <SYMBOLIC>" with an unmapped value name (e.g. state is IDLE):
+        // do not drop the value silently, and do not misfire the tautology check.
+        const symM = m[3].match(/\bis\s+([A-Za-z_]\w*)/i);
+        if (symM && !/^(high|low|asserted|deasserted|active|inactive|enabled|disabled|set|cleared|0|1)$/i.test(symM[1]) &&
+            !known.some(function(k){ return k.toLowerCase() === symM[1].toLowerCase(); }) && /^\(?\w+\)?$/.test(C)) {
+          skipped.push({ n: n, sentence: s,
+            reason: "'" + m[3].trim() + "' uses symbolic value '" + symM[1] + "' which is not mapped to a signal encoding. Add the encoding (e.g. localparam IDLE = 0) or use numeric values. It was skipped rather than guessed." });
+          return;
+        }
         // Tautology: the consequent already follows from the trigger.
         if (isTautology(A, C)) {
           skipped.push({ n: n, sentence: s,
@@ -1531,6 +2319,8 @@ function buildRequirements(body, ctx) {
         const req = mkReq(n, s, "implication",
           "If " + m[2].trim() + ", then " + m[3].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
         buildImplication(req, A, C, timing, ctx, m[3]);
+        if (!checkUnconsumed(req)) return;
+        noteResetExc(req);
         reqs.push(req);
         return;
       }
@@ -1560,6 +2350,8 @@ function buildRequirements(body, ctx) {
         const req = mkReq(n, s, "implication",
           subj + " holds only when " + m[4].trim() + ", so it implies " + m[4].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
         buildImplication(req, X, Y, timing, ctx, subj);
+        if (!checkUnconsumed(req)) return;
+        noteResetExc(req);
         reqs.push(req);
         return;
       }
@@ -1571,6 +2363,21 @@ function buildRequirements(body, ctx) {
       buildTimed(req, tp, ctx);
       reqs.push(req);
       return;
+    }
+    // "X must not fall/rise/change before Y is high/low": while Y has not reached
+    // the level, X must not do the action. e.g. "valid must not fall before ready
+    // is high" -> (!ready) |-> !$fell(valid).
+    const befM = s.match(/^\s*([A-Za-z_]\w*)\s+must\s+not\s+(fall|rise|change|toggle)\s+before\s+([A-Za-z_]\w*)\s+is\s+(high|low)[.!?]?\s*$/i);
+    if (befM) {
+      const bX = findSignalIn(befM[1], known), bY = findSignalIn(befM[3], known);
+      if (bX && bY) {
+        const act = /fall/i.test(befM[2]) ? "$fell(" + bX + ")" : /rise/i.test(befM[2]) ? "$rose(" + bX + ")" : "$changed(" + bX + ")";
+        const yCond = /high/i.test(befM[4]) ? "(!" + bY + ")" : bY;
+        const req = mkReq(n, s, "precedence", bX + " must not " + befM[2] + " before " + bY + " is " + befM[4] + ".");
+        buildImplication(req, yCond, "!(" + act + ")", null, ctx, s);
+        reqs.push(req);
+        return;
+      }
     }
     // invariant: never / must not
     if (/\b(never|must\s+not|shall\s+not|cannot|can't)\b/.test(t)) {
@@ -1620,6 +2427,8 @@ function buildRequirements(body, ctx) {
         const req = mkReq(n, s, "implication",
           "While " + m[2].trim() + ", " + m[1].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
         buildImplication(req, A, C, timing, ctx, m[1]);
+        if (!checkUnconsumed(req)) return;
+        noteResetExc(req);
         reqs.push(req);
         return;
       }
@@ -1642,6 +2451,8 @@ function buildRequirements(body, ctx) {
         const req = mkReq(n, s, "implication",
           "If " + m[3].trim() + ", then " + m[1].trim() + (timing ? " (" + timing.words + ")" : "") + ".");
         buildImplication(req, A, C, timing, ctx, m[1]);
+        if (!checkUnconsumed(req)) return;
+        noteResetExc(req);
         reqs.push(req);
         return;
       }
@@ -1678,6 +2489,106 @@ function buildRequirements(body, ctx) {
       reqs.push(req);
       return;
     }
+    // numeric range: "count must always be between 0 and 16 inclusive."
+    // Generates explicit bounds; never drops them.
+    const rgM = s.match(/^\s*(.+?)\s+(?:must|should|shall)\s+(?:always\s+)?be\s+between\s+(-?\d+)\s+and\s+(-?\d+)\s*(inclusive|exclusive)?[.!?]?\s*$/i);
+    if (rgM) {
+      const rsig = findSignalIn(rgM[1], known);
+      const lo = +rgM[2], hi = +rgM[3];
+      if (rsig && lo <= hi) {
+        const incl = !rgM[4] || /inclusive/i.test(rgM[4]);
+        const expr = incl ? rsig + " >= " + lo + " && " + rsig + " <= " + hi
+                         : rsig + " > " + lo + " && " + rsig + " < " + hi;
+        const req = mkReq(n, s, "range", rsig + " must stay in [" + lo + ", " + hi + "]" + (incl ? " inclusive." : " exclusive."));
+        buildHold(req, expr, ctx, s);
+        // width sanity: a bound that does not fit the declared width is a spec smell
+        const w = (ctx.signals.filter(function(sg){ return baseName(sg.name).toLowerCase() === baseName(rsig).toLowerCase(); })[0] || {}).width || "";
+        const wm = w.match(/\[(\d+)\s*:\s*(\d+)\]/);
+        if (wm) {
+          const W = Math.abs(+wm[1] - +wm[2]) + 1;
+          const need = hi <= 0 ? 1 : Math.floor(Math.log2(hi)) + 1;
+          if (need > W) {
+            const warn = " Note: bound " + hi + " needs " + need + " bits but " + rsig + " is " + W + " bits; (" + rsig + " <= " + hi + ") is always true. Check the width or the bound.";
+            req.levels.forEach(function(lv){ lv.note += warn; });
+          }
+        }
+        reqs.push(req);
+        return;
+      } else if (rsig && lo > hi) {
+        skipped.push({ n: n, sentence: s,
+          reason: "The range [" + lo + ", " + hi + "] is contradictory (lower bound exceeds upper bound). It was skipped rather than guessed." });
+        return;
+      }
+    }
+    // "X must equal Y N cycles later" is a pipeline delay: Y(t) == X(t-N).
+    // e.g. "data0 must equal data1 two cycles later" -> (data1 == $past(data0, 2)).
+    const laterM = s.match(/^\s*([A-Za-z_]\w*)\s+must\s+equal\s+([A-Za-z_]\w*)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+cycles?\s+later[.!?]?\s*$/i);
+    if (laterM) {
+      const lX = findSignalIn(laterM[1], known), lY = findSignalIn(laterM[2], known);
+      const numWords = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+      const lN = /^\d+$/.test(laterM[3]) ? +laterM[3] : numWords[laterM[3].toLowerCase()];
+      if (lX && lY && lN >= 1) {
+        let holdExpr = "(" + lY + " == $past(" + lX + ", " + lN + "))";
+        let gateNote = "";
+        if (lN >= 2) {
+          registerPastHelper(lN, ctx);
+          holdExpr = "(hist_valid_" + lN + " && " + holdExpr + ")";
+          gateNote = " $past(..., " + lN + ") needs " + lN + " valid post-reset samples: gated by hist_valid_" + lN + ".";
+        }
+        const req = mkReq(n, s, "pipeline-delay", lY + " must equal " + lX + " delayed by " + lN + " cycles.");
+        buildHold(req, holdExpr, ctx, s);
+        if (gateNote) req.levels.forEach(function(lv){ lv.note += gateNote; });
+        reqs.push(req);
+        return;
+      }
+    }
+    // "X must be a single-cycle pulse": when X rises, it must fall in the next cycle.
+    const pulseM = s.match(/^\s*([A-Za-z_]\w*)\s+must\s+be\s+a\s+single-cycle\s+pulse[.!?]?\s*$/i);
+    if (pulseM) {
+      const pSig = findSignalIn(pulseM[1], known);
+      if (pSig) {
+        const req = mkReq(n, s, "pulse", pSig + " must be a single-cycle pulse.");
+        const V = verbFor(req, ctx);
+        const core = "$rose(" + pSig + ") |-> ##1 (!" + pSig + ")";
+        const D = ctx.dis ? " " + ctx.dis : "";
+        addLevel(req, "Beginner", "b", oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
+          "The simplest form. Whenever the pulse rises, it must be low in the very next cycle.");
+        addLevel(req, "Intermediate", "i", propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
+          "Named property with reset handled. This is the form to check in to your testbench.");
+        addLevel(req, "Advanced", "a",
+          "sequence s_req" + req.n + "_rise;\n  $rose(" + pSig + ");\nendsequence\n" +
+          propLines(ctx, "p_req" + req.n + "_adv", "s_req" + req.n + "_rise |-> ##1 (!" + pSig + ")", V.pre + "req" + req.n + "_adv", V.kw) +
+          "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $rose(" + pSig + "));",
+          "Sequence based form plus a cover point proving the pulse occurs, so the check is not vacuous.");
+        noteRole(req, V);
+        reqs.push(req);
+        return;
+      }
+    }
+    // "X must remain stable after Y rises": from the cycle after Y rises, X must
+    // not change. -> $rose(Y) |-> ##1 $stable(X)[*1:$]
+    const stabAfterM = s.match(/^\s*([A-Za-z_]\w*)\s+must\s+(?:remain|stay)\s+stable\s+after\s+([A-Za-z_]\w*)\s+rises?\s*[.!?]?\s*$/i);
+    if (stabAfterM) {
+      const saX = findSignalIn(stabAfterM[1], known), saY = findSignalIn(stabAfterM[2], known);
+      if (saX && saY) {
+        const req = mkReq(n, s, "stable-after", saX + " must remain stable after " + saY + " rises.");
+        const V = verbFor(req, ctx);
+        const core = "$rose(" + saY + ") |-> ##1 $stable(" + saX + ")[*1:$]";
+        const D = ctx.dis ? " " + ctx.dis : "";
+        const note = " From the cycle after " + saY + " rises, " + saX + " must not change for as long as the check runs ([*1:$] is unbounded; bound it if the stable window has a known end).";
+        addLevel(req, "Beginner", "b", oneLiner(ctx, V.pre + "req" + req.n, V.kw, core, req.sentence),
+          "The simplest form." + note);
+        addLevel(req, "Intermediate", "i", propLines(ctx, "p_req" + req.n, core, V.pre + "req" + req.n, V.kw),
+          "Named property with reset handled. This is the form to check in to your testbench." + note);
+        addLevel(req, "Advanced", "a",
+          propLines(ctx, "p_req" + req.n + "_adv", core, V.pre + "req" + req.n + "_adv", V.kw) +
+          "\nc_req" + req.n + " : cover property (@(" + ctx.event + ")" + D + " $rose(" + saY + "));",
+          "Same check plus a cover point proving the trigger occurs." + note);
+        noteRole(req, V);
+        reqs.push(req);
+        return;
+      }
+    }
     if (E) {
       if (/\b(stay|stays|stayed|remain|remains|change|changes|changed|follow|followed|following|pulse|width|within|after|before|ago|until|while|during|every|each|more\s+than|at\s+least|for\s+\d+\s+cycles?|becomes|unless)\b/i.test(t)) {
         skipped.push({ n: n, sentence: s,
@@ -1692,7 +2603,26 @@ function buildRequirements(body, ctx) {
     // nothing generated for anything still ambiguous: report it, do not fake it
     skipped.push({ n: n, sentence: s, reason: "The app could not map this sentence to your declared signals. Add the signal names and explicit timing, then generate again." });
   });
-  return { reqs: reqs, skipped: skipped };
+  // Fix 2: never emit a bare edge function as a whole property. If the final core
+  // is exactly $rose/$fell/$stable/$changed with no implication, skip it.
+  const kept = [];
+  reqs.forEach(function(req){
+    const code = req.levels.length > 1 ? req.levels[1].code : req.levels[0].code;
+    const cm = code.match(/disable iff[^\n]*\n\s*(\$(?:rose|fell|stable|changed)\(\w+\))\s*;?\s*\nendproperty/);
+    if (cm) {
+      // Quote the actual trigger clause from the bare core.
+      const clauseText = cm[1]
+        .replace(/\$rose\((\w+)\)/, "$1 rises")
+        .replace(/\$fell\((\w+)\)/, "$1 falls")
+        .replace(/\$stable\((\w+)\)/, "$1 stays stable")
+        .replace(/\$changed\((\w+)\)/, "$1 changes");
+      skipped.push({ n: req.n, sentence: req.sentence,
+        reason: "This line names a trigger ('" + clauseText + "') but no consequence. If it is a heading, put the requirements under it; otherwise say what must happen when it occurs." });
+    } else {
+      kept.push(req);
+    }
+  });
+  return { reqs: kept, skipped: skipped };
 }
 
 /* ---------- UI ---------- */
@@ -1706,7 +2636,10 @@ const $ = function(id){ return document.getElementById(id); };
 function makeCtx(gate) {
   // The sampling event is the clock edge only. The reset edge is never added
   // to the event list: for async reset, "disable iff" already kills attempts
-  // the moment reset asserts; for sync reset it kills them when sampled.
+  // the moment reset asserts. For sync reset, "disable iff" is still
+  // level-sensitive (it kills the moment rst asserts, even between clocks),
+  // which is conservative versus a strictly sampled reset: an obligation may
+  // be cancelled slightly early, but it can never survive a reset.
   // Reset semantics (both kinds): reset cancels in-flight obligations.
   const event = gate.edge + " " + gate.clkName;
   const rstExpr = gate.activeLow ? "(!" + gate.rstName + ")" : gate.rstName;
@@ -1931,8 +2864,10 @@ function recommendedSv() {
   const clk = currentCtx ? currentCtx.clk : ($("clk").value.trim() || "clk");
   const rst = currentCtx ? currentCtx.rst : ($("rst").value.trim() || "rst_n");
   const sigs = currentCtx ? currentCtx.signals : [];
+  // Passive checker: every observed DUT signal (inputs and outputs alike) enters
+  // as an input port. The checker only observes; it never drives.
   const ports = ["  input logic " + clk + ",", "  input logic " + rst + ","]
-    .concat(sigs.map(function(s){ return portDecl(s) + ","; }));
+    .concat(sigs.map(function(s){ return "  input logic" + (s.width ? " " + s.width : "") + " " + baseName(s.name) + ","; }));
   const last = ports[ports.length - 1].replace(/,$/, "");
   ports[ports.length - 1] = last;
   const header =
@@ -1961,7 +2896,7 @@ function doGenerate(force, specOverride) {
   // in-flight obligations via "disable iff". The reset edge is not added to
   // the property sampling event.
   currentNotes.push(currentCtx.sync
-    ? "Synchronous reset: @(posedge " + currentCtx.clk + ") disable iff (" + (currentCtx.activeLow ? "!" + currentCtx.rst : currentCtx.rst) + "). Reset is sampled on the clock and cancels in-flight obligations; it does not merely block new ones."
+    ? "Synchronous reset: @(posedge " + currentCtx.clk + ") disable iff (" + (currentCtx.activeLow ? "!" + currentCtx.rst : currentCtx.rst) + "). Note: disable iff is level-sensitive, not sampled. Attempts are killed the moment reset asserts, even between clock edges. For a synchronous reset this is conservative (the DUT samples reset at the clock edge), so an obligation may be cancelled slightly early, but it can never survive a reset. It does not merely block new obligations."
     : "Asynchronous reset: @(posedge " + currentCtx.clk + ") disable iff (" + (currentCtx.activeLow ? "!" + currentCtx.rst : currentCtx.rst) + "). Attempts are killed the moment reset asserts; the reset edge is not in the sampling event.");
   render();
   try { pgRefreshSrc(); } catch (e) {}
@@ -2187,7 +3122,7 @@ $("shareLink").onclick = function(){
    Trace: {sig: [0|1|null,...]}, null = X. Returns per-cycle attempts. */
 
 function svaTokenize(s) {
-  const re = /\s*(\|->|\|=>|##|&&|\|\||==|!=|\d+'[sS]?[hH][0-9a-fA-F]+|\d+'[sS]?[dD]\d+|\d+'[sS]?[bB][01]+|\d+'[sS]?[oO][0-7]+|'[hH][0-9a-fA-F]+|'[dD]\d+|'[bB][01]+|'[oO][0-7]+|[A-Za-z_$][\w$]*|\d+|[()\[\]{},:!*+\-])/g;
+  const re = /\s*(\|->|\|=>|##|&&|\|\||==|!=|>=|<=|>|<|->|=|\d+'[sS]?[hH][0-9a-fA-F]+|\d+'[sS]?[dD]\d+|\d+'[sS]?[bB][01]+|\d+'[sS]?[oO][0-7]+|'[hH][0-9a-fA-F]+|'[dD]\d+|'[bB][01]+|'[oO][0-7]+|[A-Za-z_$][\w$]*|\d+|[()\[\]{},:!*+\-])/g;
   const toks = [];
   let m, last = 0;
   const stripped = s;
@@ -2207,16 +3142,54 @@ function svaParse(s) {
   const next = () => t[i++];
   function expect(v) { const p = next(); if (p !== v) throw new Error("expected " + v + " got " + p); }
 
+  // Signal name with optional bit-select: grant[3:0], req[2].
+  // Does NOT consume [*N] repetitions: only digits and ":" inside brackets.
+  function parseSigName() {
+    const q = next();
+    if (!/^[A-Za-z_]/.test(q)) throw new Error("expected signal, got " + q);
+    let name = q;
+    if (peek() === "[") {
+      const save = i;
+      next();
+      const a1 = next();
+      if (/^\d+$/.test(a1)) {
+        if (peek() === ":") {
+          next(); const a2 = next();
+          if (/^\d+$/.test(a2) && peek() === "]") { next(); return q + "[" + a1 + ":" + a2 + "]"; }
+        } else if (peek() === "]") { next(); return q + "[" + a1 + "]"; }
+      }
+      i = save; // not a bit-select; leave brackets for repetition parsing
+    }
+    return name;
+  }
+
   function prop() {
-    const a = seq();
+    let a = seq();
+    // throughout: A throughout S
+    if (peek() === "throughout") {
+      next();
+      return { k: "throughout", a: a, b: seq() };
+    }
+    // intersect: S1 intersect S2
+    if (peek() === "intersect") {
+      next();
+      return { k: "intersect", a: a, b: seq() };
+    }
     const p = peek();
     if (p === "|->" || p === "|=>") {
       next();
       let b = seq();
       if (peek() === "until") { next(); b = { k: "until", a: b, b: seq() }; }
+      if (peek() === "s_until_with") { next(); b = { k: "s_until_with", a: b, b: seq() }; }
       return { k: "impl", op: p, a: a, b: b };
     }
     if (p === "until") { next(); return { k: "until", a: a, b: seq() }; }
+    if (p === "s_until_with") { next(); return { k: "s_until_with", a: a, b: seq() }; }
+    // property-level and/or
+    if (p === "and" || p === "or") {
+      next();
+      return { k: p, a: a, b: prop() };
+    }
     return a;
   }
   function seq() {
@@ -2240,7 +3213,12 @@ function svaParse(s) {
   function delay() {
     const p = next();
     if (p === "[") {
-      const a = parseInt(next(), 10); expect(":"); const b = parseInt(next(), 10); expect("]");
+      const pa = next(); expect(":");
+      const pb = next(); expect("]");
+      const a = pa === "$" ? 0 : parseInt(pa, 10);
+      // "$" means "to end of trace": unbounded upper bound.
+      const b = pb === "$" ? Infinity : parseInt(pb, 10);
+      if (isNaN(a) || isNaN(b)) throw new Error("bad delay bound");
       return [a, b];
     }
     return [parseInt(p, 10), parseInt(p, 10)];
@@ -2250,9 +3228,27 @@ function svaParse(s) {
     if (peek() === "[") {
       next();
       if (peek() === "*") {
-        next(); const n = parseInt(next(), 10);
+        next();
+        // [*N:M] range repetition
+        const n = parseInt(next(), 10);
+        if (peek() === ":") {
+          next();
+          const mm = next();
+          const mval = mm === "$" ? Infinity : parseInt(mm, 10);
+          expect("]");
+          return { k: "repRange", base: base, n: n, m: mval };
+        }
         if (peek() === ":") { next(); expect("$"); expect("]"); return { k: "repGoto", base: base, n: n }; }
         expect("]"); return { k: "rep", base: base, n: n };
+      }
+      // [->N] goto repetition, [=N] non-consecutive repetition
+      if (peek() === "->") {
+        next(); const n = parseInt(next(), 10); expect("]");
+        return { k: "repGotoExact", base: base, n: n };
+      }
+      if (peek() === "=") {
+        next(); const n = parseInt(next(), 10); expect("]");
+        return { k: "repNonConsec", base: base, n: n };
       }
       i--;
     }
@@ -2262,12 +3258,22 @@ function svaParse(s) {
     const p = peek();
     if (p === "!") { next(); return { k: "not", e: termBase() }; }
     if (p === "(") { next(); const e = prop(); expect(")"); return e; }
+    if (p === "first_match") { next(); expect("("); const e = prop(); expect(")"); return { k: "first_match", e: e }; }
+    if (p === "s_eventually") { next(); return { k: "eventually", b: seq() }; }
+    if (p === "nexttime") {
+      next();
+      let n = 1;
+      if (peek() === "[") { next(); n = parseInt(next(), 10); expect("]"); }
+      return { k: "nexttime", n: n, e: prop() };
+    }
+    if (p === "always" || p === "s_always") { next(); return { k: "always", e: prop() }; }
+    if (p === "strong" || p === "weak") { next(); expect("("); const e = prop(); expect(")"); return { k: p, e: e }; }
     if (/^\$/.test(p)) return sysfunc();
     return bexpr();
   }
   function sysfunc() {
     const f = next(); expect("(");
-    const id = () => { const p = next(); if (!/^[A-Za-z_]/.test(p)) throw new Error("expected id"); return p; };
+    const id = () => parseSigName();
     if (f === "$rose" || f === "$fell" || f === "$stable" || f === "$isunknown") {
       const a = id(); expect(")"); return { k: f.slice(1), sig: a };
     }
@@ -2276,10 +3282,10 @@ function svaParse(s) {
       if (peek() === ",") { next(); n = parseInt(next(), 10); }
       expect(")"); return { k: "past", sig: a, n: n };
     }
-    if (f === "$onehot0") {
-      expect("{"); const args = [id()];
-      while (peek() === ",") { next(); args.push(id()); }
-      expect("}"); expect(")"); return { k: "onehot0", args: args };
+    if (f === "$onehot" || f === "$onehot0") {
+      expect("{"); const args = [parseSigName()];
+      while (peek() === ",") { next(); args.push(parseSigName()); }
+      expect("}"); expect(")"); return { k: f.slice(1), args: args };
     }
     throw new Error("unsupported " + f);
   }
@@ -2297,6 +3303,10 @@ function svaParse(s) {
     let e = barith();
     const p = peek();
     if (p === "==" || p === "!=") { next(); e = { k: p === "==" ? "eq" : "ne", a: e, b: barith() }; }
+    else if (p === ">=" || p === "<=" || p === ">" || p === "<") {
+      next();
+      e = { k: p === ">=" ? "ge" : p === "<=" ? "le" : p === ">" ? "gt" : "lt", a: e, b: barith() };
+    }
     return e;
   }
   function barith() {
@@ -2306,8 +3316,15 @@ function svaParse(s) {
   }
   function bnot() {
     if (peek() === "!") { next(); return { k: "not", e: bnot() }; }
+    if (peek() === "-") { next(); const e = bnot(); return { k: "neg", e: e }; }
     const p = peek();
     if (/^\$/.test(p)) return sysfunc();
+    // Try signal with optional bit-select first.
+    if (/^[A-Za-z_]/.test(p)) {
+      const save = i;
+      try { return { k: "sig", sig: parseSigName() }; }
+      catch (e) { i = save; }
+    }
     const q = next();
     const lv = svLitVal(q);
     if (lv !== null) return { k: "lit", v: lv };
@@ -2341,6 +3358,7 @@ function svaBval(e, trace, tt) {
     case "sig": return svaSig(trace, e.sig, tt);
     case "lit": return e.v;
     case "not": { const v = svaBval(e.e, trace, tt); return v === null ? null : (v ? 0 : 1); }
+    case "neg": { const v = svaBval(e.e, trace, tt); return v === null ? null : -v; }
     case "and": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
       if (a === 0 || b === 0) return 0; if (a === null || b === null) return null; return 1; }
     case "or": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
@@ -2348,6 +3366,10 @@ function svaBval(e, trace, tt) {
     case "eq": case "ne": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
       if (a === null || b === null) return null;
       const r = a === b ? 1 : 0; return e.k === "eq" ? r : (r ? 0 : 1); }
+    case "ge": case "le": case "gt": case "lt": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
+      if (a === null || b === null) return null;
+      const r = e.k === "ge" ? a >= b : e.k === "le" ? a <= b : e.k === "gt" ? a > b : a < b;
+      return r ? 1 : 0; }
     case "arith": { const a = svaBval(e.a, trace, tt), b = svaBval(e.b, trace, tt);
       if (a === null || b === null) return null; return e.op === "+" ? a + b : a - b; }
     case "rose": { const c = svaSig(trace, e.sig, tt), p = svaSig(trace, e.sig, tt - 1);
@@ -2373,6 +3395,13 @@ function svaRst(rst, tt) {
    Reset kills an in-flight attempt (disable iff semantics): returns killed. */
 function svaSeqMatch(items, trace, t, rst, ncyc) {
   function repOk(term, tt) {
+    // Nested parenthesized sequence: match recursively.
+    if (term.k === "seq") {
+      const r = svaSeqMatch(term.items, trace, tt, rst, ncyc);
+      if (r.killed) return -1;
+      if (r.pending) return 0; // treat pending as not-yet-matched
+      return r.ok ? 1 : 0;
+    }
     if (term.k === "rep" || term.k === "repGoto") {
       for (let k = 0; k < term.n; k++) {
         if (svaRst(rst, tt + k)) return -1;
@@ -2380,10 +3409,41 @@ function svaSeqMatch(items, trace, t, rst, ncyc) {
       }
       return 1;
     }
+    if (term.k === "repRange") {
+      // [*N:M]: try longest first (M down to N). Stores matched length for repEnd.
+      const maxM = term.m === Infinity ? ncyc - tt : term.m;
+      for (let len = Math.min(maxM, ncyc - tt); len >= term.n; len--) {
+        let okLen = true;
+        for (let k = 0; k < len; k++) {
+          if (svaRst(rst, tt + k)) return -1;
+          if (svaBval(term.base, trace, tt + k) !== 1) { okLen = false; break; }
+        }
+        if (okLen) { term._matchedLen = len; return 1; }
+      }
+      return 0;
+    }
+    if (term.k === "repGotoExact" || term.k === "repNonConsec") {
+      // Goto / non-consecutive: count occurrences from tt onward.
+      let cnt = 0;
+      for (let k = 0; k < ncyc - tt; k++) {
+        if (svaRst(rst, tt + k)) return -1;
+        if (svaBval(term.base, trace, tt + k) === 1) {
+          cnt++;
+          if (term.k === "repGotoExact" && cnt === term.n) { term._matchedEnd = tt + k; return 1; }
+        }
+      }
+      if (cnt >= term.n) { term._matchedEnd = tt + (ncyc - tt) - 1; return 1; }
+      return 0;
+    }
     if (svaRst(rst, tt)) return -1;
     return svaBval(term, trace, tt) === 1 && !svaRst(rst, tt) ? 1 : 0;
   }
-  function repEnd(term, tt) { return (term.k === "rep" || term.k === "repGoto") ? tt + term.n - 1 : tt; }
+  function repEnd(term, tt) {
+    if (term.k === "rep" || term.k === "repGoto") return tt + term.n - 1;
+    if (term.k === "repRange") return tt + (term._matchedLen || term.n) - 1;
+    if ((term.k === "repGotoExact" || term.k === "repNonConsec") && term._matchedEnd !== undefined) return term._matchedEnd;
+    return tt;
+  }
   const first = items[0];
   let cur, idx;
   if (first === null) { cur = t; idx = 1; }
@@ -2396,9 +3456,14 @@ function svaSeqMatch(items, trace, t, rst, ncyc) {
   for (let j = idx; j < items.length; j++) {
     const d = items[j][0], term = items[j][1];
     let found = -1;
-    for (let dd = d[0]; dd <= d[1]; dd++) {
+    let pending = false;
+    // Unbounded upper bound ($): try every remaining cycle. If the trace ends
+    // before a match, the attempt is pending, not failed.
+    const unbounded = d[1] === Infinity;
+    const hi = unbounded ? ncyc - cur : d[1];
+    for (let dd = d[0]; dd <= hi; dd++) {
       const tt = cur + dd;
-      if (tt >= ncyc) break;
+      if (tt >= ncyc) { pending = unbounded; break; }
       let killed = false;
       for (let x = cur + 1; x <= tt; x++) if (svaRst(rst, x)) { killed = true; break; }
       if (killed) return { ok: true, end: tt, killed: true };
@@ -2406,7 +3471,10 @@ function svaSeqMatch(items, trace, t, rst, ncyc) {
       if (mr < 0) return { ok: true, end: tt, killed: true };
       if (mr) { found = tt; break; }
     }
-    if (found < 0) return { ok: false, end: cur };
+    if (found < 0) {
+      if (pending) return { ok: false, end: cur, pending: true };
+      return { ok: false, end: cur };
+    }
     cur = repEnd(term, found);
   }
   return { ok: true, end: cur };
@@ -2422,7 +3490,7 @@ function svaUntilOk(a, b, trace, t0, ncyc, rst) {
 }
 
 /* Full check. Returns {verdict, attempts:[{t, result, end, detail}]}.
-   result: pass|fail|vacuous-killed. verdict: PASS|FAIL|VACUOUS|ERROR */
+   result: pass|fail|pending|vacuous-killed. verdict: PASS|FAIL|PENDING|VACUOUS|ERROR */
 function svaCheck(core, trace, ncyc, rstName) {
   let ast;
   try { ast = svaParse(core); }
@@ -2437,14 +3505,14 @@ function svaCheck(core, trace, ncyc, rstName) {
       const t0 = t + (ast.op === "|=>" ? 1 : 0);
       let r;
       if (ast.b.k === "eventually") {
-        let ok = false, end = t0;
+        let ok = false, killed = false, end = t0;
         for (let tt = t0; tt < ncyc; tt++) {
-          if (svaRst(rst, tt)) break;
+          if (svaRst(rst, tt)) { killed = true; break; }
           if (svaBval(ast.b.b, trace, tt) === 1) { ok = true; end = tt; break; }
         }
-        r = ok ? { ok: true, end: end } : { ok: false, end: t0 };
-        note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "completed" : "never completed");
-        if (!r.ok) return { verdict: "FAIL", attempts: attempts };
+        r = ok ? { ok: true, end: end } : { ok: false, killed: killed, end: t0 };
+        note(t, r.killed ? "vacuous-killed" : (r.ok ? "pass" : "fail"), r.end, r.killed ? "killed by reset" : (r.ok ? "completed" : "never completed"));
+        if (!r.ok && !r.killed) return { verdict: "FAIL", attempts: attempts };
       } else if (ast.b.k === "until") {
         r = svaUntilOk(ast.b.a, ast.b.b, trace, t0, ncyc, rst);
         note(t, r.ok ? "pass" : "fail", r.end, r.ok ? "until held" : "until broken");
@@ -2452,6 +3520,10 @@ function svaCheck(core, trace, ncyc, rstName) {
       } else {
         const items = ast.b.k === "seq" ? ast.b.items : [ast.b];
         r = svaSeqMatch(items, trace, t0, rst, ncyc);
+        if (r.pending) {
+          note(t, "pending", r.end, "pending (trace ended)");
+          return { verdict: "PENDING", attempts: attempts };
+        }
         note(t, r.killed ? "vacuous-killed" : (r.ok ? "pass" : "fail"), r.end, r.killed ? "killed by reset" : (r.ok ? "completed" : "no match"));
         if (!r.ok) return { verdict: "FAIL", attempts: attempts };
       }
@@ -2465,6 +3537,10 @@ function svaCheck(core, trace, ncyc, rstName) {
       if (svaRst(rst, t)) continue;
       const items = ast.k === "seq" ? ast.items : [ast];
       const r = svaSeqMatch(items, trace, t, rst, ncyc);
+      if (r.pending) {
+        note(t, "pending", r.end, "pending (trace ended)");
+        return { verdict: "PENDING", attempts: attempts };
+      }
       note(t, r.killed ? "vacuous-killed" : (r.ok ? "pass" : "fail"), r.end, r.killed ? "killed by reset" : (r.ok ? "holds" : "violated"));
       if (!r.ok) return { verdict: "FAIL", attempts: attempts };
     }
@@ -2591,15 +3667,24 @@ function pgRender() {
     const r = explainSva("a1: assert property (@(posedge clk) " + pg.core + ");");
     if (r && r[0] && r[0].english) desc = r[0].english;
   } catch (e) {}
-  const res = svaCheck(pg.core, pg.trace, PG_NCYC, "rst_n");
+  const res = (function(){
+    try { return svaCheck(pg.core, pg.trace, PG_NCYC, "rst_n"); }
+    catch (e) {
+      const msg = String((e && e.message) || e);
+      // Name the construct that could not be evaluated.
+      const cm = msg.match(/eval (\w+)/) || msg.match(/unsupported (\S+)/) || msg.match(/expected (\S+)/);
+      return { verdict: "ERROR", attempts: [], detail: "cannot evaluate " + (cm ? cm[1] : "construct") + ": " + msg };
+    }
+  })();
   pg.last = res;
   // verdict badge
   const vb = $("pgVerdict");
   const fired = res.attempts.length;
   if (res.verdict === "PASS") { vb.className = "badge pass"; vb.textContent = "PASS" + (fired ? " (" + fired + " checks)" : ""); }
   else if (res.verdict === "FAIL") { vb.className = "badge fail"; vb.textContent = "FAIL"; }
+  else if (res.verdict === "PENDING") { vb.className = "badge vac"; vb.textContent = "PENDING (trace ended before a match)"; }
   else if (res.verdict === "VACUOUS") { vb.className = "badge vac"; vb.textContent = "VACUOUS (never triggered)"; }
-  else { vb.className = "badge err"; vb.textContent = "ERROR"; }
+  else { vb.className = "badge err"; vb.textContent = res.detail || "ERROR"; }
   // grid
   const tbl = $("pgGrid");
   tbl.innerHTML = "";
